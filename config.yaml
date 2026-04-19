@@ -37,7 +37,7 @@ train:
   fp16: false
   tf32: true
 
-  logging_steps: 10
+  logging_steps: 1
   save_steps: 500
   save_total_limit: 2
   dataloader_num_workers: 4
