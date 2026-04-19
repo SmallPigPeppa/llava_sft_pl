@@ -413,7 +413,7 @@ class LlavaSFTLightningModule(pl.LightningModule):
         outputs = self.model(**batch)
         loss = self._loss_from_outputs(outputs)
         self.log(
-            "train_loss",
+            "train/loss",
             loss,
             on_step=True,
             on_epoch=True,
@@ -428,7 +428,7 @@ class LlavaSFTLightningModule(pl.LightningModule):
         outputs = self.model(**batch)
         loss = self._loss_from_outputs(outputs)
         self.log(
-            "val_loss",
+            "val/loss",
             loss,
             on_step=False,
             on_epoch=True,
