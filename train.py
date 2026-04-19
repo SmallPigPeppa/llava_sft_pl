@@ -430,8 +430,8 @@ class LlavaSFTLightningModule(pl.LightningModule):
         self.log(
             "val/loss",
             loss,
-            on_step=False,
-            on_epoch=True,
+            # on_step=False,
+            # on_epoch=True,
             prog_bar=True,
             logger=True,
             batch_size=self._batch_size(batch),
