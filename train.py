@@ -461,14 +461,14 @@ class LlavaLightningModule(LightningModule):
         outputs = self.model(**batch)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
         batch_size = int(batch["input_ids"].shape[0]) if "input_ids" in batch else None
-        self.log("loss", loss, on_step=True, on_epoch=False, prog_bar=True, logger=True, batch_size=batch_size)
+        self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True, logger=True, batch_size=batch_size)
         return loss
 
     def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         outputs = self.model(**batch)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
         batch_size = int(batch["input_ids"].shape[0]) if "input_ids" in batch else None
-        self.log("eval_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
+        self.log("eval/loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
         return loss
 
     def on_before_optimizer_step(self, optimizer: torch.optim.Optimizer) -> None:
