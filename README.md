@@ -74,6 +74,7 @@ train:
   per_device_train_batch_size -> DataLoader(batch_size=...)
   per_device_eval_batch_size  -> eval DataLoader(batch_size=...)
   gradient_accumulation_steps -> Trainer(accumulate_grad_batches=...)
+  gradient_clip_val           -> Trainer(gradient_clip_val=...)
   learning_rate               -> torch.optim.AdamW(lr=...)
   lr_scheduler_type           -> transformers.get_scheduler(...)
   warmup_ratio / warmup_steps -> scheduler warmup
