@@ -1,10 +1,13 @@
 # minimal_llava_lightning_trainer
 
-这是从原始 LFactory 项目里压缩出来的最小训练项目，保留三件事：
+这是从原始 LFactory 项目里压缩出来的最小训练项目，现在训练主干已经从 Hugging Face `Trainer` 切换为 Lightning `Trainer`，其余模型、数据、LoRA 和 YAML 参数入口保持不变。
 
-1. 基于 Lightning `Trainer` 的训练主干；
+保留内容：
+
+1. LLaVA 模型加载、LoRA 注入、vision tower / projector 冻结逻辑；
 2. ShareGPT/LLaVA 格式数据加载与图文样本组 batch 的核心逻辑；
-3. 所有关键参数都放在 YAML 里控制。
+3. 原有 `configs/demo2k.yaml` 参数名和命令行 override 方式；
+4. W&B 日志、不开 checkpoint、可选最终模型保存等行为。
 
 默认配置对应你原来的 `train_llava15_lora_demo_2k.sh`：
 
@@ -25,15 +28,28 @@ WANDB_PROJECT=CL-debug python src/train.py examples/train_lora/llava15_lora_next
   fp16=false
 ```
 
-在这个精简版里，这些参数都进入了 `configs/demo2k.yaml`。
+在这个精简版里，这些参数都进入了 `configs/demo2k.yaml`，运行方式仍然是：
+
+```bash
+python train.py --config configs/demo2k.yaml
+```
+
+也可以继续临时覆盖 YAML 参数：
+
+```bash
+python train.py --config configs/demo2k.yaml \
+  train.learning_rate=1e-4 \
+  data.max_samples=64 \
+  train.num_train_epochs=1
+```
 
 ## 文件结构
 
 ```text
-minimal_llava_lightning_trainer/
-├── train.py              # 模型加载、LoRA、LightningModule、Lightning Trainer、W&B、是否保存模型
+llava_sft_hf/
+├── train.py              # 模型加载、LoRA、Lightning Trainer、W&B、是否保存模型
 ├── data.py               # dataset_info.json 读取、Parquet/JSON/HF 数据加载、ShareGPT->SFT 编码
-├── configs/demo2k.yaml   # demo2k 的完整 YAML 配置
+├── configs/demo2k.yaml   # demo2k 的完整 YAML 配置，参数名保持不变
 ├── requirements.txt
 ├── run_demo2k.sh
 └── README.md
@@ -42,7 +58,7 @@ minimal_llava_lightning_trainer/
 ## 安装
 
 ```bash
-cd minimal_llava_lightning_trainer
+cd llava_sft_hf
 pip install -r requirements.txt
 ```
 
@@ -78,19 +94,28 @@ export WANDB_API_KEY=你的_key
 ./run_demo2k.sh
 ```
 
-也可以临时覆盖 YAML 参数：
+## HF Trainer 参数到 Lightning 的对应关系
 
-```bash
-python train.py --config configs/demo2k.yaml \
-  train.learning_rate=1e-4 \
-  data.max_samples=64 \
-  train.num_train_epochs=1
+`train.py` 仍然读取原来的 `train:` 配置字段，并在内部映射到 Lightning：
+
+```yaml
+train:
+  per_device_train_batch_size: 1      # Lightning DataLoader batch_size
+  gradient_accumulation_steps: 8      # accumulate_grad_batches
+  learning_rate: 2.0e-4               # AdamW lr
+  lr_scheduler_type: cosine           # transformers.get_scheduler
+  warmup_ratio: 0.03                  # warmup steps = total_steps * ratio
+  bf16: true                          # Lightning precision=bf16-mixed
+  fp16: false                         # Lightning precision=16-mixed when true
+  logging_steps: 1                    # log_every_n_steps
+  eval_strategy: steps                # Lightning validation interval
+  eval_steps: 500                     # 按 HF 的 optimizer step 语义映射
+  report_to: [wandb]                  # Lightning WandbLogger
+  save_checkpoint: false              # enable_checkpointing=false
+  save_model_at_end: false            # 训练结束不额外保存模型
 ```
 
-
-## Lightning 迁移说明
-
-训练入口和 YAML 覆盖方式不变；`train.py` 内部已从 HF `Trainer/TrainingArguments` 切换为 `LightningModule + pl.Trainer`。原有 `train.*` 字段继续沿用：batch size、gradient accumulation、learning rate、scheduler、warmup、bf16/fp16、logging/eval/save、W&B、DDP 相关字段都会在 Lightning 路径中映射。
+优化器使用 `torch.optim.AdamW`，scheduler 使用 `transformers.get_scheduler`，所以 `learning_rate`、`weight_decay`、`warmup_ratio`、`warmup_steps`、`lr_scheduler_type`、`num_train_epochs`、`max_steps` 等字段继续有效。
 
 ## W&B 与 checkpoint
 
@@ -105,11 +130,11 @@ train:
   save_model_at_end: false
 ```
 
-这意味着：训练日志会上报到 W&B；Lightning Trainer 不保存中间 checkpoint；训练结束也不额外保存 LoRA adapter。如果之后需要保存最终 LoRA 权重，把 `save_model_at_end` 改成 `true` 即可。
+这意味着：训练日志会上报到 W&B；Lightning 不保存中间 checkpoint；训练结束也不额外保存 LoRA adapter。如果之后需要保存最终 LoRA 权重，把 `save_model_at_end` 改成 `true` 即可。
 
 ## 这个精简版删掉了什么
 
-为了保持最小化，删掉了原 LLaMA-Factory/LFactory 中的大量通用能力，例如 WebUI、多训练阶段、DPO/RM/PPO、复杂模板库、多模态视频/音频、packing、4D attention mask、量化导出、DeepSpeed/FSDP 专用保存逻辑等。
+为了保持最小化，删掉了原 LLaMA-Factory/LFactory 中的大量通用能力，例如 WebUI、多训练阶段、DPO/RM/PPO、复杂模板库、多模态视频/音频、packing、4D attention mask、量化导出、FSDP 专用保存逻辑等。
 
 当前脚本聚焦：LLaVA-1.5 + ShareGPT 图文 SFT + LoRA + Lightning Trainer + W&B。
 

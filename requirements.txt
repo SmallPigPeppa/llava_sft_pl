@@ -1,11 +1,10 @@
 torch
 transformers>=4.46.0
 accelerate
+lightning>=2.2.0
 peft>=0.10.0
 datasets
 pillow
 pyyaml
 wandb
 pyarrow
-
-lightning==2.1.0

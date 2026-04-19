@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 from datetime import timedelta
+import os
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -21,12 +22,12 @@ from torch.utils.data import DataLoader
 from transformers import AutoProcessor, get_scheduler, set_seed
 
 try:
-    import lightning.pytorch as pl
+    from lightning.pytorch import LightningDataModule, LightningModule, Trainer as LightningTrainer, seed_everything
     from lightning.pytorch.callbacks import ModelCheckpoint
     from lightning.pytorch.loggers import WandbLogger
     from lightning.pytorch.strategies import DDPStrategy, DeepSpeedStrategy
-except ImportError:  # pragma: no cover - compatibility for older installations.
-    import pytorch_lightning as pl
+except ImportError:  # pragma: no cover - compatibility for environments that install pytorch-lightning only
+    from pytorch_lightning import LightningDataModule, LightningModule, Trainer as LightningTrainer, seed_everything
     from pytorch_lightning.callbacks import ModelCheckpoint
     from pytorch_lightning.loggers import WandbLogger
     from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
@@ -42,6 +43,63 @@ EXCLUDE_LORA_KEYWORDS = (
     "mm_projector",
     "projector",
     "lm_head",
+)
+
+
+HF_TRAINING_ARG_KEYS_TO_IGNORE = {
+    # Kept in YAML for HF-Trainer compatibility. Lightning handles these concepts directly below.
+    "remove_unused_columns",
+    "save_checkpoint",
+    "save_strategy",
+    "save_steps",
+    "save_total_limit",
+    "save_model_at_end",
+    "report_to",
+    "run_name",
+    "output_dir",
+    "resume_from_checkpoint",
+    "logging_steps",
+    "per_device_train_batch_size",
+    "per_device_eval_batch_size",
+    "gradient_accumulation_steps",
+    "learning_rate",
+    "num_train_epochs",
+    "max_steps",
+    "lr_scheduler_type",
+    "warmup_ratio",
+    "warmup_steps",
+    "bf16",
+    "fp16",
+    "tf32",
+    "ddp_timeout",
+    "ddp_find_unused_parameters",
+    "eval_strategy",
+    "evaluation_strategy",
+    "eval_steps",
+    "dataloader_num_workers",
+    "dataloader_drop_last",
+    "dataloader_pin_memory",
+    "weight_decay",
+    "adam_beta1",
+    "adam_beta2",
+    "adam_epsilon",
+    "max_grad_norm",
+    "optim",
+    "deepspeed",
+    "pad_to_multiple_of",
+    "use_cache",
+}
+
+
+NO_DECAY_KEYWORDS = (
+    "bias",
+    "layernorm",
+    "layer_norm",
+    "rmsnorm",
+    "rms_norm",
+    "ln_",
+    ".ln",
+    "norm.weight",
 )
 
 
@@ -106,6 +164,37 @@ def resolve_torch_dtype(name: Any):
     return mapping[str(name).lower()]
 
 
+def apply_runtime_flags(train_cfg: dict[str, Any]) -> None:
+    tf32 = bool(train_cfg.get("tf32", True))
+    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+    if hasattr(torch.backends.cudnn, "allow_tf32"):
+        torch.backends.cudnn.allow_tf32 = tf32
+
+
+def set_use_cache(model: torch.nn.Module, value: bool = False) -> None:
+    """Set KV-cache flag on wrapper, inner language model, configs and generation_config."""
+    seen: set[int] = set()
+
+    def _set(obj: Any) -> None:
+        if obj is None or id(obj) in seen:
+            return
+        seen.add(id(obj))
+
+        if hasattr(obj, "use_cache"):
+            obj.use_cache = value
+
+        for attr in ("config", "generation_config", "text_config", "language_config"):
+            _set(getattr(obj, attr, None))
+
+    _set(model)
+
+    # Cover nested modules such as model.language_model / base_model / PEFT wrapper.
+    for module in model.modules():
+        _set(getattr(module, "config", None))
+        _set(getattr(module, "generation_config", None))
+
+
 def load_vision_language_model(model_cfg: dict[str, Any]):
     """Load processor + LLaVA model while keeping imports compatible across Transformers versions."""
     model_name = model_cfg["model_name_or_path"]
@@ -141,10 +230,14 @@ def load_vision_language_model(model_cfg: dict[str, Any]):
 
         model = LlavaForConditionalGeneration.from_pretrained(model_name, **model_kwargs)
 
+    # Training defaults to no KV cache; gradient checkpointing requires cache to be disabled.
+    if not bool(model_cfg.get("use_cache", False)):
+        set_use_cache(model, False)
+
     if bool(model_cfg.get("gradient_checkpointing", False)):
+        set_use_cache(model, False)  # must be before first forward
         model.gradient_checkpointing_enable()
-        if hasattr(model.config, "use_cache"):
-            model.config.use_cache = False
+        set_use_cache(model, False)  # cover nested configs again
 
     return model, processor, tokenizer
 
@@ -280,68 +373,156 @@ class LlavaDataCollator:
         return batch
 
 
+class LlavaLightningDataModule(LightningDataModule):
+    """Lightning DataModule that mirrors the Hugging Face Trainer dataloader settings."""
 
-class LlavaLightningModule(pl.LightningModule):
-    """Lightning wrapper that keeps the original HF model forward/loss behavior."""
+    def __init__(
+        self,
+        train_dataset: ShareGPTLlavaDataset,
+        eval_dataset: ShareGPTLlavaDataset | None,
+        data_collator: LlavaDataCollator,
+        train_cfg: dict[str, Any],
+    ) -> None:
+        super().__init__()
+        self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
+        self.data_collator = data_collator
+        self.train_cfg = train_cfg
+
+    def _common_loader_kwargs(self) -> dict[str, Any]:
+        num_workers = int(self.train_cfg.get("dataloader_num_workers", 0))
+        kwargs: dict[str, Any] = {
+            "num_workers": num_workers,
+            "pin_memory": bool(self.train_cfg.get("dataloader_pin_memory", True)),
+            "collate_fn": self.data_collator,
+        }
+        if num_workers > 0:
+            kwargs["persistent_workers"] = bool(self.train_cfg.get("dataloader_persistent_workers", False))
+            if self.train_cfg.get("dataloader_prefetch_factor") is not None:
+                kwargs["prefetch_factor"] = int(self.train_cfg["dataloader_prefetch_factor"])
+        return kwargs
+
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.train_dataset,
+            batch_size=int(self.train_cfg.get("per_device_train_batch_size", 8)),
+            shuffle=True,
+            drop_last=bool(self.train_cfg.get("dataloader_drop_last", False)),
+            **self._common_loader_kwargs(),
+        )
+
+    def val_dataloader(self) -> DataLoader | None:
+        if self.eval_dataset is None:
+            return None
+        return DataLoader(
+            self.eval_dataset,
+            batch_size=int(self.train_cfg.get("per_device_eval_batch_size", 8)),
+            shuffle=False,
+            drop_last=False,
+            **self._common_loader_kwargs(),
+        )
+
+
+def _is_no_decay_parameter(name: str, param: torch.nn.Parameter) -> bool:
+    lowered = name.lower()
+    return param.ndim < 2 or any(keyword in lowered for keyword in NO_DECAY_KEYWORDS)
+
+
+def build_optimizer_grouped_parameters(model: torch.nn.Module, weight_decay: float) -> list[dict[str, Any]]:
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if _is_no_decay_parameter(name, param):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    return [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+
+
+class LlavaLightningModule(LightningModule):
+    """LightningModule that keeps the HF Trainer optimization/scheduler semantics."""
 
     def __init__(self, model: torch.nn.Module, train_cfg: dict[str, Any]) -> None:
         super().__init__()
         self.model = model
-        self.train_cfg = dict(train_cfg)
+        self.train_cfg = train_cfg
+        self.save_hyperparameters({"train": dict(train_cfg)})
 
-    def forward(self, **batch):
+    def forward(self, **batch: torch.Tensor):
         return self.model(**batch)
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         outputs = self.model(**batch)
-        loss = outputs.loss
-        self.log(
-            "train/loss",
-            loss,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=True,
-            logger=True,
-            batch_size=_infer_batch_size(batch),
-        )
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
+        batch_size = int(batch["input_ids"].shape[0]) if "input_ids" in batch else None
+        self.log("loss", loss, on_step=True, on_epoch=False, prog_bar=True, logger=True, batch_size=batch_size)
         return loss
 
     def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         outputs = self.model(**batch)
-        loss = outputs.loss
-        self.log(
-            "eval/loss",
-            loss,
-            on_step=False,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-            sync_dist=True,
-            batch_size=_infer_batch_size(batch),
-        )
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
+        batch_size = int(batch["input_ids"].shape[0]) if "input_ids" in batch else None
+        self.log("eval_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size)
         return loss
 
-    def configure_optimizers(self):
-        optimizer = build_optimizer(self.model, self.train_cfg)
+    def on_before_optimizer_step(self, optimizer: torch.optim.Optimizer) -> None:
+        if optimizer.param_groups:
+            self.log(
+                "learning_rate",
+                optimizer.param_groups[0]["lr"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,
+            )
 
-        num_training_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0) or 0)
-        max_steps = self.train_cfg.get("max_steps")
-        if max_steps is not None and int(max_steps) > 0:
-            num_training_steps = int(max_steps)
-        if num_training_steps <= 0:
-            num_training_steps = 1
+    def configure_optimizers(self):
+        learning_rate = float(self.train_cfg.get("learning_rate", 5e-5))
+        weight_decay = float(self.train_cfg.get("weight_decay", 0.0))
+        betas = (
+            float(self.train_cfg.get("adam_beta1", 0.9)),
+            float(self.train_cfg.get("adam_beta2", 0.999)),
+        )
+        eps = float(self.train_cfg.get("adam_epsilon", 1e-8))
+        optim_name = str(self.train_cfg.get("optim", "adamw_torch")).lower()
+
+        if optim_name in {"adamw", "adamw_torch", "adamw_hf"}:
+            optimizer = torch.optim.AdamW(
+                build_optimizer_grouped_parameters(self.model, weight_decay=weight_decay),
+                lr=learning_rate,
+                betas=betas,
+                eps=eps,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported train.optim={optim_name!r} in Lightning port. "
+                "Use adamw_torch/adamw, or add the optimizer mapping here."
+            )
+
+        lr_scheduler_type = str(self.train_cfg.get("lr_scheduler_type", "linear"))
+        estimated_steps = int(getattr(self.trainer, "estimated_stepping_batches", 0) or 0)
+        explicit_max_steps = self.train_cfg.get("max_steps")
+        if explicit_max_steps is not None and int(explicit_max_steps) > 0:
+            num_training_steps = int(explicit_max_steps)
+        else:
+            num_training_steps = max(estimated_steps, 1)
 
         warmup_steps = self.train_cfg.get("warmup_steps")
-        if warmup_steps is None:
-            warmup_steps = 0
-        warmup_steps = int(warmup_steps)
-        if warmup_steps <= 0:
-            warmup_steps = int(math.ceil(num_training_steps * float(self.train_cfg.get("warmup_ratio", 0.0))))
+        if warmup_steps is not None and int(warmup_steps) > 0:
+            num_warmup_steps = int(warmup_steps)
+        else:
+            num_warmup_steps = int(math.ceil(num_training_steps * float(self.train_cfg.get("warmup_ratio", 0.0))))
 
         scheduler = get_scheduler(
-            name=str(self.train_cfg.get("lr_scheduler_type", "linear")),
+            name=lr_scheduler_type,
             optimizer=optimizer,
-            num_warmup_steps=warmup_steps,
+            num_warmup_steps=num_warmup_steps,
             num_training_steps=num_training_steps,
         )
         return {
@@ -354,105 +535,38 @@ class LlavaLightningModule(pl.LightningModule):
         }
 
 
-def _infer_batch_size(batch: dict[str, Any]) -> int | None:
-    input_ids = batch.get("input_ids") if isinstance(batch, dict) else None
-    if isinstance(input_ids, torch.Tensor) and input_ids.ndim > 0:
-        return int(input_ids.shape[0])
-    return None
-
-
-def normalize_report_to(value: Any) -> list[str]:
-    if value is None:
-        return ["wandb"]
-    if isinstance(value, str):
-        parts = [x.strip() for x in value.split(",") if x.strip()]
-    else:
-        parts = [str(x).strip() for x in value if str(x).strip()]
-
-    disabled = {"none", "no", "false", "null", "[]"}
-    if not parts or any(x.lower() in disabled for x in parts):
+def normalize_report_to(report_to: Any) -> list[str]:
+    if report_to is None:
         return []
-    return parts
+    if isinstance(report_to, str):
+        lowered = report_to.lower()
+        if lowered in {"none", "null", "false", "off", ""}:
+            return []
+        return [item.strip().lower() for item in report_to.split(",") if item.strip()]
+    if isinstance(report_to, (list, tuple, set)):
+        values = [str(item).lower() for item in report_to]
+        return [] if any(item in {"none", "null", "false", "off"} for item in values) else values
+    return [str(report_to).lower()]
 
 
-def build_optimizer(model: torch.nn.Module, train_cfg: dict[str, Any]) -> torch.optim.Optimizer:
-    decay_parameters: set[str]
-    try:
-        from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
-        from transformers.trainer_pt_utils import get_parameter_names
+def build_logger(train_cfg: dict[str, Any], wandb_project: str | None) -> Any:
+    report_to = normalize_report_to(train_cfg.get("report_to", ["wandb"]))
+    if not report_to:
+        return False
 
-        decay_parameters = set(get_parameter_names(model, ALL_LAYERNORM_LAYERS))
-        decay_parameters = {name for name in decay_parameters if "bias" not in name}
-    except Exception:
-        no_decay = ("bias", "LayerNorm.weight", "layer_norm.weight", "norm.weight")
-        decay_parameters = {
-            name
-            for name, param in model.named_parameters()
-            if param.requires_grad and not any(nd in name for nd in no_decay)
-        }
+    output_dir = str(train_cfg.get("output_dir", "outputs"))
+    run_name = train_cfg.get("run_name")
 
-    named_params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
-    optimizer_grouped_parameters = [
-        {
-            "params": [param for name, param in named_params if name in decay_parameters],
-            "weight_decay": float(train_cfg.get("weight_decay", 0.0)),
-        },
-        {
-            "params": [param for name, param in named_params if name not in decay_parameters],
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer_grouped_parameters = [group for group in optimizer_grouped_parameters if group["params"]]
+    if "wandb" in report_to:
+        return WandbLogger(
+            project=wandb_project or os.environ.get("WANDB_PROJECT"),
+            name=str(run_name) if run_name else None,
+            save_dir=output_dir,
+            log_model=False,
+        )
 
-    optim_name = str(train_cfg.get("optim", "adamw_torch")).lower()
-    betas = (float(train_cfg.get("adam_beta1", 0.9)), float(train_cfg.get("adam_beta2", 0.999)))
-    eps = float(train_cfg.get("adam_epsilon", 1e-8))
-    lr = float(train_cfg.get("learning_rate", 5e-5))
-
-    if optim_name in {"adamw", "adamw_hf", "adamw_torch", "adamw_torch_fused"}:
-        kwargs: dict[str, Any] = {"lr": lr, "betas": betas, "eps": eps}
-        if optim_name == "adamw_torch_fused":
-            kwargs["fused"] = True
-        return torch.optim.AdamW(optimizer_grouped_parameters, **kwargs)
-    if optim_name == "sgd":
-        return torch.optim.SGD(optimizer_grouped_parameters, lr=lr)
-
-    raise ValueError(f"Unsupported optimizer for Lightning path: {optim_name!r}")
-
-
-def build_dataloader(
-    dataset,
-    collator: LlavaDataCollator,
-    train_cfg: dict[str, Any],
-    *,
-    train: bool,
-) -> DataLoader:
-    batch_key = "per_device_train_batch_size" if train else "per_device_eval_batch_size"
-    default_batch_size = train_cfg.get("per_device_train_batch_size", 1)
-    batch_size = int(train_cfg.get(batch_key, default_batch_size))
-    num_workers = int(train_cfg.get("dataloader_num_workers", 0))
-    pin_memory = bool(train_cfg.get("dataloader_pin_memory", True))
-    persistent_workers = bool(train_cfg.get("dataloader_persistent_workers", False)) and num_workers > 0
-    drop_last = bool(train_cfg.get("dataloader_drop_last", False)) if train else False
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=train,
-        collate_fn=collator,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        drop_last=drop_last,
-    )
-
-
-def configure_tf32(train_cfg: dict[str, Any]) -> None:
-    tf32 = train_cfg.get("tf32")
-    if tf32 is None or not torch.cuda.is_available():
-        return
-    torch.backends.cuda.matmul.allow_tf32 = bool(tf32)
-    torch.backends.cudnn.allow_tf32 = bool(tf32)
+    # Lightning's default logger covers unsupported HF report targets without changing training.
+    return True
 
 
 def resolve_precision(train_cfg: dict[str, Any]) -> str:
@@ -463,148 +577,166 @@ def resolve_precision(train_cfg: dict[str, Any]) -> str:
     return "32-true"
 
 
-def resolve_devices(train_cfg: dict[str, Any]) -> Any:
-    if "devices" in train_cfg:
-        return train_cfg["devices"]
-    if "num_devices" in train_cfg:
-        return train_cfg["num_devices"]
-    # HF Trainer uses one device for a normal `python train.py` launch. With torchrun,
-    # WORLD_SIZE is set and Lightning should attach to the distributed environment.
-    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        return "auto"
-    return 1
+def train_batches_per_epoch(train_dataset: ShareGPTLlavaDataset, train_cfg: dict[str, Any]) -> int:
+    batch_size = max(int(train_cfg.get("per_device_train_batch_size", 8)), 1)
+    dataset_size = len(train_dataset)
+    if bool(train_cfg.get("dataloader_drop_last", False)):
+        return max(dataset_size // batch_size, 1)
+    return max(math.ceil(dataset_size / batch_size), 1)
 
 
-def resolve_strategy(train_cfg: dict[str, Any], devices: Any):
-    deepspeed_config = train_cfg.get("deepspeed")
-    if deepspeed_config:
-        return DeepSpeedStrategy(config=deepspeed_config)
+def resolve_max_epochs_and_steps(train_dataset: ShareGPTLlavaDataset, train_cfg: dict[str, Any]) -> tuple[int, int]:
+    explicit_max_steps = train_cfg.get("max_steps")
+    if explicit_max_steps is not None and int(explicit_max_steps) > 0:
+        return -1, int(explicit_max_steps)
 
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    distributed = world_size > 1 or (isinstance(devices, int) and devices > 1) or devices == "auto"
-    if not distributed:
-        return "auto"
+    num_train_epochs = float(train_cfg.get("num_train_epochs", 3.0))
+    grad_accum = max(int(train_cfg.get("gradient_accumulation_steps", 1)), 1)
 
-    find_unused = train_cfg.get("ddp_find_unused_parameters")
-    timeout_seconds = int(train_cfg.get("ddp_timeout", 1800))
-    kwargs: dict[str, Any] = {"timeout": timedelta(seconds=timeout_seconds)}
-    if find_unused is not None:
-        kwargs["find_unused_parameters"] = bool(find_unused)
+    if not num_train_epochs.is_integer():
+        update_steps_per_epoch = max(math.ceil(train_batches_per_epoch(train_dataset, train_cfg) / grad_accum), 1)
+        return int(math.ceil(num_train_epochs)), int(math.ceil(num_train_epochs * update_steps_per_epoch))
+
+    return max(int(num_train_epochs), 1), -1
+
+
+def build_callbacks(train_cfg: dict[str, Any], logger_enabled: bool) -> list[Any]:
+    callbacks: list[Any] = []
+
+    save_checkpoint = bool(train_cfg.get("save_checkpoint", True))
+    save_strategy = str(train_cfg.get("save_strategy", "steps")).lower()
+    if save_checkpoint and save_strategy != "no":
+        output_dir = Path(str(train_cfg.get("output_dir", "outputs")))
+        checkpoint_dir = output_dir / "checkpoints"
+        common_kwargs: dict[str, Any] = {
+            "dirpath": str(checkpoint_dir),
+            "filename": "step-{step}",
+            "save_last": True,
+            "save_top_k": -1,
+            "auto_insert_metric_name": False,
+        }
+        if save_strategy == "steps":
+            common_kwargs["every_n_train_steps"] = int(train_cfg.get("save_steps", 500))
+        elif save_strategy == "epoch":
+            common_kwargs["every_n_epochs"] = 1
+        callbacks.append(ModelCheckpoint(**common_kwargs))
+
+    return callbacks
+
+
+def resolve_validation_kwargs(train_cfg: dict[str, Any], has_eval_dataset: bool) -> dict[str, Any]:
+    if not has_eval_dataset:
+        return {"limit_val_batches": 0}
+
+    eval_strategy = str(train_cfg.get("eval_strategy", train_cfg.get("evaluation_strategy", "no"))).lower()
+    if eval_strategy in {"no", "none", "false", "off"}:
+        return {"limit_val_batches": 0}
+
+    if eval_strategy == "steps":
+        # HF Trainer's eval_steps counts optimizer steps; Lightning's integer val_check_interval
+        # counts train batches, so multiply by grad accumulation to preserve the same cadence.
+        interval_batches = int(train_cfg.get("eval_steps", 500)) * max(int(train_cfg.get("gradient_accumulation_steps", 1)), 1)
+        return {
+            "val_check_interval": max(interval_batches, 1),
+            "check_val_every_n_epoch": None,
+        }
+
+    if eval_strategy == "epoch":
+        return {"check_val_every_n_epoch": 1}
+
+    raise ValueError(f"Unsupported eval_strategy/evaluation_strategy={eval_strategy!r}")
+
+
+def devices_request_multiple(train_cfg: dict[str, Any]) -> bool:
+    devices = train_cfg.get("devices")
+    if isinstance(devices, int):
+        return devices > 1
+    if isinstance(devices, str):
+        lowered = devices.lower()
+        if lowered in {"auto", "-1"}:
+            return False
+        try:
+            return int(lowered) > 1
+        except ValueError:
+            return "," in lowered
+    if isinstance(devices, (list, tuple, set)):
+        return len(devices) > 1
+    return False
+
+
+def build_ddp_strategy(train_cfg: dict[str, Any]) -> DDPStrategy:
+    kwargs: dict[str, Any] = {}
+    if train_cfg.get("ddp_find_unused_parameters") is not None:
+        kwargs["find_unused_parameters"] = bool(train_cfg["ddp_find_unused_parameters"])
+    if train_cfg.get("ddp_timeout") is not None:
+        kwargs["timeout"] = timedelta(seconds=int(train_cfg["ddp_timeout"]))
     return DDPStrategy(**kwargs)
 
 
-def build_logger(cfg: dict[str, Any]):
-    train_cfg = cfg.get("train", {})
-    report_to = normalize_report_to(train_cfg.get("report_to"))
-    if "wandb" not in {x.lower() for x in report_to}:
-        return False
+def resolve_strategy(train_cfg: dict[str, Any]) -> Any:
+    if train_cfg.get("deepspeed") is not None:
+        return DeepSpeedStrategy(config=train_cfg["deepspeed"])
 
-    return WandbLogger(
-        project=os.environ.get("WANDB_PROJECT") or cfg.get("wandb_project") or train_cfg.get("wandb_project"),
-        name=train_cfg.get("run_name"),
-        save_dir=train_cfg.get("output_dir", "."),
-    )
+    strategy = train_cfg.get("strategy")
+    if strategy is not None:
+        if str(strategy).lower() == "ddp":
+            return build_ddp_strategy(train_cfg)
+        return strategy
 
+    # Keep single-device behavior unchanged. If the user explicitly asks Lightning for
+    # multiple devices, carry over HF-style DDP knobs.
+    if devices_request_multiple(train_cfg) and (
+        train_cfg.get("ddp_find_unused_parameters") is not None or train_cfg.get("ddp_timeout") is not None
+    ):
+        return build_ddp_strategy(train_cfg)
 
-def build_checkpoint_callbacks(train_cfg: dict[str, Any]) -> list[ModelCheckpoint]:
-    save_checkpoint = bool(train_cfg.get("save_checkpoint", False))
-    save_strategy = str(train_cfg.get("save_strategy", "steps")).lower()
-    if not save_checkpoint or save_strategy == "no":
-        return []
-
-    output_dir = str(train_cfg.get("output_dir", "outputs"))
-    save_total_limit = train_cfg.get("save_total_limit")
-    save_top_k = int(save_total_limit) if save_total_limit is not None else -1
-    common = {
-        "dirpath": os.path.join(output_dir, "checkpoints"),
-        "filename": "epoch={epoch}-step={step}",
-        "save_top_k": save_top_k,
-        "save_last": False,
-        "auto_insert_metric_name": False,
-    }
-
-    if save_strategy == "epoch":
-        return [ModelCheckpoint(every_n_epochs=1, **common)]
-    if save_strategy == "steps":
-        return [ModelCheckpoint(every_n_train_steps=int(train_cfg.get("save_steps", 500)), **common)]
-
-    raise ValueError(f"Unsupported save_strategy for Lightning path: {save_strategy!r}")
+    return "auto"
 
 
-def build_lightning_trainer(cfg: dict[str, Any], train_loader: DataLoader, has_eval: bool) -> pl.Trainer:
-    train_cfg = cfg.get("train", {})
-    configure_tf32(train_cfg)
+def warn_unused_train_keys(train_cfg: dict[str, Any]) -> None:
+    extra_keys = sorted(set(train_cfg) - HF_TRAINING_ARG_KEYS_TO_IGNORE - {"accelerator", "devices", "strategy"})
+    if extra_keys:
+        print(f"Warning: train keys are present but not explicitly mapped in the Lightning port: {extra_keys}")
 
-    callbacks = build_checkpoint_callbacks(train_cfg)
-    devices = resolve_devices(train_cfg)
 
-    num_train_epochs = float(train_cfg.get("num_train_epochs", 1.0))
-    max_epochs = int(math.ceil(num_train_epochs))
-    accumulate_grad_batches = int(train_cfg.get("gradient_accumulation_steps", 1))
+def build_lightning_trainer(
+    train_dataset: ShareGPTLlavaDataset,
+    eval_dataset: ShareGPTLlavaDataset | None,
+    train_cfg: dict[str, Any],
+    wandb_project: str | None,
+) -> LightningTrainer:
+    warn_unused_train_keys(train_cfg)
 
-    max_steps = train_cfg.get("max_steps")
-    if max_steps is None:
-        # Lightning's max_epochs is integer-only; compute max_steps for fractional
-        # epochs so HF-style values such as 0.5 or 1.5 keep the same meaning.
-        if not num_train_epochs.is_integer():
-            updates_per_epoch = max(1, math.ceil(len(train_loader) / accumulate_grad_batches))
-            max_steps = int(math.ceil(num_train_epochs * updates_per_epoch))
-        else:
-            max_steps = -1
-    else:
-        max_steps = int(max_steps)
-    if max_steps > 0:
-        # HF TrainingArguments.max_steps overrides num_train_epochs.
-        max_epochs = -1
-
-    # Lightning accepts integer val_check_interval as a number of train batches. HF's
-    # eval_steps are optimizer-update steps, so multiply by gradient accumulation.
-    eval_strategy = str(train_cfg.get("eval_strategy", train_cfg.get("evaluation_strategy", "no"))).lower()
-    val_check_interval: int | float | None = None
-    check_val_every_n_epoch: int | None = 1
-    limit_val_batches: int | float | None = None
-    if not has_eval or eval_strategy == "no":
-        limit_val_batches = 0
-    elif eval_strategy == "steps":
-        val_check_interval = max(1, int(train_cfg.get("eval_steps", 500)) * accumulate_grad_batches)
-        check_val_every_n_epoch = None
-    elif eval_strategy == "epoch":
-        check_val_every_n_epoch = 1
-    else:
-        raise ValueError(f"Unsupported eval_strategy for Lightning path: {eval_strategy!r}")
+    max_epochs, max_steps = resolve_max_epochs_and_steps(train_dataset, train_cfg)
+    logger = build_logger(train_cfg, wandb_project=wandb_project)
+    checkpointing_enabled = bool(train_cfg.get("save_checkpoint", True)) and str(train_cfg.get("save_strategy", "steps")).lower() != "no"
 
     trainer_kwargs: dict[str, Any] = {
-        "default_root_dir": train_cfg.get("output_dir", "outputs"),
+        "default_root_dir": str(train_cfg.get("output_dir", "outputs")),
         "accelerator": train_cfg.get("accelerator", "auto"),
-        "devices": devices,
-        "strategy": resolve_strategy(train_cfg, devices),
+        "devices": train_cfg.get("devices", "auto"),
         "precision": resolve_precision(train_cfg),
         "max_epochs": max_epochs,
         "max_steps": max_steps,
-        "accumulate_grad_batches": accumulate_grad_batches,
+        "accumulate_grad_batches": int(train_cfg.get("gradient_accumulation_steps", 1)),
         "gradient_clip_val": float(train_cfg.get("max_grad_norm", 1.0)),
-        "logger": build_logger(cfg),
-        "callbacks": callbacks,
-        "enable_checkpointing": bool(callbacks),
-        "log_every_n_steps": int(train_cfg.get("logging_steps", 50)),
-        "num_sanity_val_steps": int(train_cfg.get("num_sanity_val_steps", 0)),
-        "use_distributed_sampler": bool(train_cfg.get("use_distributed_sampler", True)),
+        "log_every_n_steps": int(train_cfg.get("logging_steps", 500)),
+        "logger": logger,
+        "callbacks": build_callbacks(train_cfg, logger_enabled=bool(logger)),
+        "enable_checkpointing": checkpointing_enabled,
+        "num_sanity_val_steps": 0,
+        "strategy": resolve_strategy(train_cfg),
     }
-    if val_check_interval is not None:
-        trainer_kwargs["val_check_interval"] = val_check_interval
-    if check_val_every_n_epoch is not None:
-        trainer_kwargs["check_val_every_n_epoch"] = check_val_every_n_epoch
-    if limit_val_batches is not None:
-        trainer_kwargs["limit_val_batches"] = limit_val_batches
-
-    return pl.Trainer(**trainer_kwargs)
+    trainer_kwargs.update(resolve_validation_kwargs(train_cfg, has_eval_dataset=eval_dataset is not None))
+    return LightningTrainer(**trainer_kwargs)
 
 
-def maybe_save_final_model(trainer: pl.Trainer, lightning_module: LlavaLightningModule, processor, output_dir: str) -> None:
-    if not trainer.is_global_zero:
-        return
+def save_final_model(model: torch.nn.Module, processor: Any, output_dir: str) -> None:
     os.makedirs(output_dir, exist_ok=True)
-    lightning_module.model.save_pretrained(output_dir)
+    if hasattr(model, "save_pretrained"):
+        model.save_pretrained(output_dir)
+    else:
+        torch.save(model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
     if hasattr(processor, "save_pretrained"):
         processor.save_pretrained(output_dir)
 
@@ -615,7 +747,8 @@ def main() -> None:
 
     seed = int(cfg.get("seed", cfg.get("data", {}).get("seed", 42)))
     set_seed(seed)
-    pl.seed_everything(seed, workers=True)
+    seed_everything(seed, workers=True)
+    apply_runtime_flags(cfg.get("train", {}))
 
     wandb_project = cfg.get("wandb_project") or cfg.get("train", {}).get("wandb_project")
     if wandb_project:
@@ -623,6 +756,9 @@ def main() -> None:
 
     model, processor, tokenizer = load_vision_language_model(cfg["model"])
     model = apply_lora(model, cfg.get("lora", {}))
+
+    if not bool(cfg["model"].get("use_cache", False)):
+        set_use_cache(model, False)
 
     data_cfg = cfg["data"]
     spec = read_dataset_spec(data_cfg)
@@ -662,23 +798,27 @@ def main() -> None:
         processor=processor,
         pad_to_multiple_of=train_cfg.get("pad_to_multiple_of"),
     )
-    train_loader = build_dataloader(train_ds, collator, train_cfg, train=True)
-    eval_loader = build_dataloader(eval_ds, collator, train_cfg, train=False) if eval_ds is not None else None
-
+    data_module = LlavaLightningDataModule(
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        data_collator=collator,
+        train_cfg=train_cfg,
+    )
     lightning_module = LlavaLightningModule(model=model, train_cfg=train_cfg)
-    trainer = build_lightning_trainer(cfg, train_loader, has_eval=eval_loader is not None)
-    trainer.fit(
-        lightning_module,
-        train_dataloaders=train_loader,
-        val_dataloaders=eval_loader,
-        ckpt_path=train_cfg.get("resume_from_checkpoint"),
+    lightning_trainer = build_lightning_trainer(
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        train_cfg=train_cfg,
+        wandb_project=str(wandb_project) if wandb_project else None,
     )
 
-    output_dir = str(train_cfg.get("output_dir", "outputs"))
+    resume_from_checkpoint = train_cfg.get("resume_from_checkpoint")
+    lightning_trainer.fit(lightning_module, datamodule=data_module, ckpt_path=resume_from_checkpoint)
+
     if bool(train_cfg.get("save_model_at_end", False)):
-        maybe_save_final_model(trainer, lightning_module, processor, output_dir)
-    elif trainer.is_global_zero:
-        print("Training finished. Checkpoint/model saving disabled; metrics/logs are sent to W&B when enabled.")
+        save_final_model(lightning_module.model, processor, str(train_cfg.get("output_dir", "outputs")))
+    else:
+        print("Training finished. Checkpoint/model saving disabled; metrics/logs are sent to W&B if enabled.")
 
 
 if __name__ == "__main__":
