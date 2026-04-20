@@ -1,334 +1,370 @@
 from __future__ import annotations
 
-import copy
-import math
+import re
+from copy import deepcopy
 from dataclasses import dataclass, field
-from io import BytesIO
-from typing import Any
+from enum import Enum
+from typing import Any, Optional, Union
 
-IMAGE_PLACEHOLDER = "<image>"
-VIDEO_PLACEHOLDER = "<video>"
-AUDIO_PLACEHOLDER = "<audio>"
-IGNORE_INDEX = -100
-BOS = "__bos_token__"
-EOS = "__eos_token__"
+from ..extras import get_logger
+from .mm_plugin import BasePlugin, get_mm_plugin
 
-Slot = str
+logger = get_logger(__name__)
+SLOTS = list[Union[str, set[str], dict[str, str]]]
 
 
-def _replace(slot: str, content: str) -> str:
-    return slot.replace("{{content}}", content)
+class Role(str, Enum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+    FUNCTION = "function"
+    OBSERVATION = "observation"
 
 
-def _load_image(image: Any):
-    try:
-        from PIL import Image
-        from PIL.Image import Image as PILImage
-    except Exception as exc:  # pragma: no cover - depends on runtime env
-        raise ImportError("Pillow is required for image training data. Install `pillow`.") from exc
+@dataclass
+class Formatter:
+    slots: SLOTS = field(default_factory=list)
 
-    if isinstance(image, PILImage):
-        img = image
-    elif isinstance(image, bytes):
-        img = Image.open(BytesIO(image))
-    elif isinstance(image, dict):
-        if image.get("bytes") is not None:
-            img = Image.open(BytesIO(image["bytes"]))
-        elif image.get("path") is not None:
-            img = Image.open(image["path"])
-        else:
-            raise ValueError(f"Unsupported image dict: {image!r}")
-    else:
-        img = Image.open(image)
+    def apply(self, **kwargs: Any) -> SLOTS:
+        rendered: SLOTS = []
+        for slot in self.slots:
+            if isinstance(slot, str):
+                text = slot
+                for key, value in kwargs.items():
+                    text = text.replace("{{" + key + "}}", "" if value is None else str(value))
+                rendered.append(text)
+            else:
+                rendered.append(slot)
+        return rendered
 
-    return img.convert("RGB") if getattr(img, "mode", "RGB") != "RGB" else img
+    def extract(self, content: str) -> str:
+        return content
 
 
-def _resize_for_limits(image: Any, max_pixels: int, min_pixels: int):
-    pixels = image.width * image.height
-    if pixels > max_pixels:
-        scale = math.sqrt(max_pixels / pixels)
-        image = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
-    elif pixels < min_pixels:
-        scale = math.sqrt(min_pixels / pixels)
-        image = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
-    return image
+class EmptyFormatter(Formatter):
+    pass
+
+
+class StringFormatter(Formatter):
+    pass
+
+
+class FunctionFormatter(StringFormatter):
+    def __init__(self, slots: SLOTS | None = None, tool_format: str | None = None) -> None:
+        super().__init__(slots or ["{{content}}", {"eos_token"}])
+        self.tool_format = tool_format
+
+
+class ToolFormatter(Formatter):
+    def __init__(self, slots: SLOTS | None = None, tool_format: str | None = None) -> None:
+        super().__init__(slots or ["\n{{content}}"])
+        self.tool_format = tool_format
+
+    def apply(self, **kwargs: Any) -> SLOTS:
+        content = kwargs.get("content")
+        return super().apply(content=content) if content else []
 
 
 @dataclass
 class Template:
-    """Compact chat template with the LLaVA-family multimodal handling kept intact."""
-
-    name: str
-    user: list[Slot]
-    assistant: list[Slot] = field(default_factory=lambda: ["{{content}}", EOS])
-    system: list[Slot] = field(default_factory=lambda: ["{{content}}"])
-    prefix: list[Slot] = field(default_factory=list)
+    format_user: Formatter
+    format_assistant: Formatter
+    format_system: Formatter
+    format_function: Formatter
+    format_observation: Formatter
+    format_tools: Formatter
+    format_prefix: Formatter
     default_system: str = ""
     stop_words: list[str] = field(default_factory=list)
-    replace_eos: bool = False
+    thought_words: tuple[str, str] = ("<think>\n", "\n</think>\n\n")
+    tool_call_words: tuple[str, str] = ("<tool_call>", "</tool_call>")
     efficient_eos: bool = False
-    image_token: str | None = IMAGE_PLACEHOLDER
-    video_token: str | None = None
-    image_strategy: str = "llava"  # llava | llava_next | none
+    replace_eos: bool = False
+    replace_jinja_template: bool = False
+    enable_thinking: Optional[bool] = True
+    mm_plugin: BasePlugin = field(default_factory=lambda: get_mm_plugin("base"))
 
-    def clone(self) -> "Template":
-        return copy.deepcopy(self)
-
-    def _slot_to_ids(self, tokenizer: Any, slot: Slot, content: str = "") -> list[int]:
-        if slot == BOS:
-            return [] if tokenizer.bos_token_id is None else [tokenizer.bos_token_id]
-        if slot == EOS:
-            return [] if tokenizer.eos_token_id is None else [tokenizer.eos_token_id]
-        text = _replace(slot, content)
-        return tokenizer.encode(text, add_special_tokens=False) if text else []
-
-    def _encode_slots(self, tokenizer: Any, slots: list[Slot], content: str = "") -> list[int]:
-        ids: list[int] = []
-        for slot in slots:
-            ids.extend(self._slot_to_ids(tokenizer, slot, content))
-        return ids
+    def encode_oneturn(
+        self,
+        tokenizer: Any,
+        messages: list[dict[str, str]],
+        system: Optional[str] = None,
+        tools: Optional[str] = None,
+    ) -> tuple[list[int], list[int]]:
+        encoded = self._encode(tokenizer, messages, system, tools)
+        return sum(encoded[:-1], []), encoded[-1]
 
     def encode_multiturn(
         self,
         tokenizer: Any,
         messages: list[dict[str, str]],
-        system: str | None = None,
-        tools: str | None = None,
+        system: Optional[str] = None,
+        tools: Optional[str] = None,
     ) -> list[tuple[list[int], list[int]]]:
-        if len(messages) % 2 != 0:
-            raise ValueError("SFT messages must be user/assistant pairs.")
+        encoded = self._encode(tokenizer, messages, system, tools)
+        return [(encoded[i], encoded[i + 1]) for i in range(0, len(encoded), 2)]
 
-        system_text = self.default_system if system is None or system == "" else system
-        if tools:
-            system_text = (system_text + "\n" if system_text else "") + str(tools)
+    def extract_tool(self, content: str) -> str:
+        return self.format_tools.extract(content)
 
-        encoded: list[list[int]] = []
-        for i, message in enumerate(messages):
-            role, content = message["role"], message["content"]
-            if i % 2 == 0 and role != "user":
-                raise ValueError(f"Expected user message at turn {i}, got {role!r}.")
-            if i % 2 == 1 and role != "assistant":
-                raise ValueError(f"Expected assistant message at turn {i}, got {role!r}.")
+    def get_stop_token_ids(self, tokenizer: Any) -> list[int]:
+        token_ids = {tokenizer.eos_token_id}
+        for token in self.stop_words:
+            token_ids.add(tokenizer.convert_tokens_to_ids(token))
+        return list(token_ids)
 
-            if role == "user":
-                ids: list[int] = []
-                if i == 0:
-                    ids.extend(self._encode_slots(tokenizer, self.prefix))
-                    if system_text:
-                        ids.extend(self._encode_slots(tokenizer, self.system, system_text))
-                ids.extend(self._encode_slots(tokenizer, self.user, content))
+    def add_thought(self, content: str = "") -> str:
+        return f"{self.thought_words[0]}{self.thought_words[1]}" + content
+
+    def remove_thought(self, content: str) -> str:
+        pattern = re.compile(f"{re.escape(self.thought_words[0])}(.*?){re.escape(self.thought_words[1])}", re.DOTALL)
+        return re.sub(pattern, "", content).lstrip("\n")
+
+    def get_thought_word_ids(self, tokenizer: Any) -> list[int]:
+        return tokenizer.encode(self.add_thought(), add_special_tokens=False)
+
+    def _convert_elements_to_ids(self, tokenizer: Any, elements: SLOTS) -> list[int]:
+        token_ids: list[int] = []
+        for element in elements:
+            if isinstance(element, str):
+                if element:
+                    token_ids.extend(tokenizer.encode(element, add_special_tokens=False))
+            elif isinstance(element, set):
+                if "bos_token" in element and tokenizer.bos_token_id is not None:
+                    token_ids.append(tokenizer.bos_token_id)
+                if "eos_token" in element and tokenizer.eos_token_id is not None:
+                    token_ids.append(tokenizer.eos_token_id)
+            elif isinstance(element, dict):
+                token = element.get("token")
+                if token:
+                    token_ids.append(tokenizer.convert_tokens_to_ids(token))
             else:
-                ids = self._encode_slots(tokenizer, self.assistant, content)
-            encoded.append(ids)
+                raise TypeError(f"Unsupported template slot: {element!r}")
+        return token_ids
 
-        pairs = [(encoded[i], encoded[i + 1]) for i in range(0, len(encoded), 2)]
-        return pairs
+    def _encode(self, tokenizer: Any, messages: list[dict[str, str]], system: Optional[str], tools: Optional[str]) -> list[list[int]]:
+        system = system if system is not None else self.default_system
+        encoded_messages: list[list[int]] = []
+        for i, message in enumerate(messages):
+            elements: SLOTS = []
+            if i == 0:
+                elements += self.format_prefix.apply()
+                if system or tools:
+                    tool_text = self.format_tools.apply(content=tools)[0] if tools else ""
+                    elements += self.format_system.apply(content=(system or "") + tool_text)
+
+            role = message["role"]
+            content = message.get("content", "")
+            if role == Role.USER.value:
+                elements += self.format_user.apply(content=content, idx=str(i // 2))
+            elif role == Role.ASSISTANT.value:
+                elements += self.format_assistant.apply(content=content)
+            elif role == Role.OBSERVATION.value:
+                elements += self.format_observation.apply(content=content)
+            elif role == Role.FUNCTION.value:
+                elements += self.format_function.apply(content=content, thought_words=self.thought_words, tool_call_words=self.tool_call_words)
+            else:
+                raise ValueError(f"Unexpected message role: {role}")
+            encoded_messages.append(self._convert_elements_to_ids(tokenizer, elements))
+        return encoded_messages
 
     def fix_special_tokens(self, tokenizer: Any) -> None:
-        if self.replace_eos and self.stop_words:
-            eos = self.stop_words[0]
-            if tokenizer.eos_token != eos:
-                tokenizer.add_special_tokens({"eos_token": eos})
-
+        stop_words = list(self.stop_words)
+        if self.replace_eos:
+            if not stop_words:
+                raise ValueError("Stop words are required to replace EOS.")
+            self._add_or_replace_eos_token(tokenizer, stop_words.pop(0))
         if tokenizer.eos_token_id is None:
-            tokenizer.add_special_tokens({"eos_token": "<|endoftext|>"})
+            self._add_or_replace_eos_token(tokenizer, "<|endoftext|>")
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
-
-        extra = self.stop_words[1:] if self.replace_eos else self.stop_words
-        if extra:
+            logger.info_rank0(f"Add pad token: {tokenizer.pad_token}")
+        if stop_words:
             try:
-                tokenizer.add_special_tokens(
-                    {"additional_special_tokens": extra},
-                    replace_additional_special_tokens=False,
-                )
-            except TypeError:  # older transformers
-                tokenizer.add_special_tokens({"additional_special_tokens": extra})
+                tokenizer.add_special_tokens({"additional_special_tokens": stop_words}, replace_additional_special_tokens=False)
+            except TypeError:
+                tokenizer.add_special_tokens({"additional_special_tokens": stop_words})
+            logger.info_rank0("Add stop words: %s", ",".join(stop_words))
 
-    def _regularize_images(self, images: list[Any], processor: Any) -> list[Any]:
-        max_pixels = int(getattr(processor, "image_max_pixels", 768 * 768))
-        min_pixels = int(getattr(processor, "image_min_pixels", 32 * 32))
-        return [_resize_for_limits(_load_image(image), max_pixels, min_pixels) for image in images]
+    @staticmethod
+    def _add_or_replace_eos_token(tokenizer: Any, eos_token: str) -> None:
+        if tokenizer.eos_token == eos_token:
+            return
+        tokenizer.add_special_tokens({"eos_token": eos_token})
+        logger.info_rank0(f"Set eos token: {tokenizer.eos_token}")
 
-    def image_inputs(self, images: list[Any], processor: Any) -> dict[str, Any]:
-        if not images:
-            return {}
-        if processor is None or getattr(processor, "image_processor", None) is None:
-            raise ValueError("Image data requires a Hugging Face processor with an image_processor.")
-        return processor.image_processor(self._regularize_images(images, processor), return_tensors="pt")
-
-    def _image_token_counts(self, images: list[Any], processor: Any) -> list[int]:
-        if not images:
-            return []
-        if self.image_strategy == "none":
-            return [1] * len(images)
-
-        mm_inputs = self.image_inputs(images, processor)
-        strategy = getattr(processor, "vision_feature_select_strategy", "default")
-        patch_size = int(getattr(processor, "patch_size", 14))
-        additional = int(getattr(processor, "num_additional_image_tokens", 1))
-
-        if self.image_strategy == "llava_next" and "image_sizes" in mm_inputs:
-            pixel_values = mm_inputs["pixel_values"]
-            # LlavaNext image processor returns [num_images, num_patches, C, H, W].
-            first_tile = pixel_values[0][0] if getattr(pixel_values, "ndim", 0) == 5 else pixel_values[0]
-            height, width = int(first_tile.shape[-2]), int(first_tile.shape[-1])
-            counts = []
-            for orig_height, orig_width in mm_inputs["image_sizes"].tolist():
-                count = int(processor._get_number_of_features(orig_height, orig_width, height, width))
-                counts.append(count - 1 if strategy == "default" else count)
-            return counts
-
-        pixel_values = mm_inputs.get("pixel_values")
-        if pixel_values is None:
-            return [1] * len(images)
-        height, width = int(pixel_values[0].shape[-2]), int(pixel_values[0].shape[-1])
-        count = (height // patch_size) * (width // patch_size) + additional
-        if strategy == "default":
-            count -= 1
-        return [max(1, count)] * len(images)
-
-    def process_messages(
-        self,
-        messages: list[dict[str, str]],
-        images: list[Any],
-        videos: list[Any] | None,
-        audios: list[Any] | None,
-        processor: Any,
-    ) -> list[dict[str, str]]:
-        if videos:
-            raise ValueError("This slim build keeps image SFT only; video preprocessing was removed.")
-        if audios:
-            raise ValueError("This slim build keeps image SFT only; audio preprocessing was removed.")
-        if images and self.image_token is None:
-            raise ValueError(f"Template {self.name!r} does not support images.")
-
-        expected_images = sum(m["content"].count(IMAGE_PLACEHOLDER) for m in messages)
-        if expected_images != len(images):
-            raise ValueError(f"Found {expected_images} <image> placeholders but {len(images)} images.")
-
-        counts = iter(self._image_token_counts(images, processor))
-        processed = copy.deepcopy(messages)
-        for message in processed:
-            content = message["content"]
-            while IMAGE_PLACEHOLDER in content:
-                replacement = (self.image_token or IMAGE_PLACEHOLDER) * next(counts)
-                content = content.replace(IMAGE_PLACEHOLDER, replacement, 1)
-            message["content"] = content
-        return processed
+    def fix_jinja_template(self, tokenizer: Any) -> None:
+        # Training only needs token ids built by this module. Keeping the tokenizer
+        # chat_template untouched avoids carrying the large original Jinja generator.
+        return None
 
 
-VICUNA_SYSTEM = (
-    "A chat between a curious user and an artificial intelligence assistant. "
-    "The assistant gives helpful, detailed, and polite answers to the user's questions."
-)
+@dataclass
+class ReasoningTemplate(Template):
+    def encode_oneturn(self, tokenizer: Any, messages: list[dict[str, str]], system: Optional[str] = None, tools: Optional[str] = None) -> tuple[list[int], list[int]]:
+        messages = deepcopy(messages)
+        if self.enable_thinking is False and len(messages) >= 2:
+            messages[-1]["content"] = self.remove_thought(messages[-1]["content"])
+        prompt_ids, response_ids = super().encode_oneturn(tokenizer, messages, system, tools)
+        if len(messages) >= 2 and self.thought_words[0].strip() not in messages[-1]["content"] and self.thought_words[1].strip() not in messages[-1]["content"]:
+            if not self.enable_thinking:
+                prompt_ids += self.get_thought_word_ids(tokenizer)
+            else:
+                response_ids = self.get_thought_word_ids(tokenizer) + response_ids
+        return prompt_ids, response_ids
 
-CHATML_USER = ["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]
-CHATML_ASSISTANT = ["{{content}}<|im_end|>\n"]
-CHATML_SYSTEM = ["<|im_start|>system\n{{content}}<|im_end|>\n"]
+    def encode_multiturn(self, tokenizer: Any, messages: list[dict[str, str]], system: Optional[str] = None, tools: Optional[str] = None) -> list[tuple[list[int], list[int]]]:
+        messages = deepcopy(messages)
+        if self.enable_thinking is False:
+            for i in range(1, len(messages), 2):
+                messages[i]["content"] = self.remove_thought(messages[i]["content"])
+        encoded = self._encode(tokenizer, messages, system, tools)
+        for i in range(0, len(messages), 2):
+            answer = messages[i + 1]["content"]
+            if self.thought_words[0].strip() not in answer and self.thought_words[1].strip() not in answer:
+                if not self.enable_thinking:
+                    encoded[i] += self.get_thought_word_ids(tokenizer)
+                else:
+                    encoded[i + 1] = self.get_thought_word_ids(tokenizer) + encoded[i + 1]
+        return [(encoded[i], encoded[i + 1]) for i in range(0, len(encoded), 2)]
 
-TEMPLATES: dict[str, Template] = {
-    "empty": Template(name="empty", user=["{{content}}"], image_token=None, image_strategy="none"),
-    "default": Template(name="default", user=["{{content}}"], image_token=None, image_strategy="none"),
-    "vicuna": Template(name="vicuna", user=["USER: {{content}} ASSISTANT:"], default_system=VICUNA_SYSTEM),
-    "llava": Template(
-        name="llava",
-        user=["USER: {{content}} ASSISTANT:"],
-        default_system=VICUNA_SYSTEM,
-        image_token="<image>",
-        image_strategy="llava",
-    ),
-    "llava_next": Template(
-        name="llava_next",
-        user=["USER: {{content}} ASSISTANT:"],
-        default_system=VICUNA_SYSTEM,
-        image_token="<image>",
-        image_strategy="llava_next",
-    ),
-    "llava_next_llama3": Template(
-        name="llava_next_llama3",
-        user=["<|start_header_id|>user<|end_header_id|>\n\n{{content}}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"],
-        assistant=["{{content}}<|eot_id|>"],
-        system=["<|start_header_id|>system<|end_header_id|>\n\n{{content}}<|eot_id|>"],
-        prefix=[BOS],
-        stop_words=["<|eot_id|>", "<|eom_id|>"],
-        replace_eos=True,
-        image_token="<image>",
-        image_strategy="llava_next",
-    ),
-    "llava_next_mistral": Template(
-        name="llava_next_mistral",
-        user=["[INST] {{content}}[/INST]"],
-        assistant=[" {{content}}", EOS],
-        system=["{{content}}\n\n"],
-        prefix=[BOS],
-        image_token="<image>",
-        image_strategy="llava_next",
-    ),
-    "llava_next_qwen": Template(
-        name="llava_next_qwen",
-        user=CHATML_USER,
-        assistant=CHATML_ASSISTANT,
-        system=CHATML_SYSTEM,
-        default_system="You are a helpful assistant.",
-        stop_words=["<|im_end|>"],
-        replace_eos=True,
-        image_token="<image>",
-        image_strategy="llava_next",
-    ),
-    "llava_next_yi": Template(
-        name="llava_next_yi",
-        user=CHATML_USER,
-        assistant=CHATML_ASSISTANT,
-        system=CHATML_SYSTEM,
-        stop_words=["<|im_end|>"],
-        image_token="<image>",
-        image_strategy="llava_next",
-    ),
-    "yi_vl": Template(
-        name="yi_vl",
-        user=["### Human: {{content}}\n### Assistant:"],
-        assistant=["{{content}}\n"],
-        default_system=(
-            "This is a chat between an inquisitive human and an AI assistant. "
-            "Assume the role of the AI assistant. Read all the images carefully, "
-            "and respond to the human's questions with informative, helpful, detailed and polite answers. "
-            "这是一个好奇的人类和一个人工智能助手之间的对话。假设你扮演这个AI助手的角色。"
-            "仔细阅读所有的图像，并对人类的问题做出信息丰富、有帮助、详细的和礼貌的回答。\n\n"
-        ),
-        stop_words=["###"],
-        efficient_eos=True,
-        image_token="<image>",
-        image_strategy="llava",
-    ),
-}
 
-# Keep the original LLaVA-video template names discoverable. The slim build rejects
-# actual video columns at preprocessing time with a clear error instead of carrying
-# thousands of lines of video/audio code.
-for _name, _base in {
-    "video_llava": "llava",
-    "llava_next_video": "llava_next",
-    "llava_next_video_mistral": "llava_next_mistral",
-    "llava_next_video_yi": "llava_next_yi",
-}.items():
-    TEMPLATES[_name] = TEMPLATES[_base].clone()
-    TEMPLATES[_name].name = _name
-    TEMPLATES[_name].video_token = VIDEO_PLACEHOLDER
+TEMPLATES: dict[str, Template] = {}
+
+
+def register_template(
+    name: str,
+    format_user: Formatter | None = None,
+    format_assistant: Formatter | None = None,
+    format_system: Formatter | None = None,
+    format_function: Formatter | None = None,
+    format_observation: Formatter | None = None,
+    format_tools: Formatter | None = None,
+    format_prefix: Formatter | None = None,
+    default_system: str = "",
+    stop_words: list[str] | None = None,
+    thought_words: tuple[str, str] | None = None,
+    tool_call_words: tuple[str, str] | None = None,
+    efficient_eos: bool = False,
+    replace_eos: bool = False,
+    replace_jinja_template: bool = False,
+    enable_thinking: Optional[bool] = True,
+    mm_plugin: BasePlugin | None = None,
+    template_class: type[Template] = Template,
+) -> None:
+    if name in TEMPLATES:
+        raise ValueError(f"Template {name} already exists.")
+    default_slots: SLOTS = ["{{content}}"] if efficient_eos else ["{{content}}", {"eos_token"}]
+    assistant = format_assistant or StringFormatter(default_slots)
+    user = format_user or StringFormatter(["{{content}}"])
+    TEMPLATES[name] = template_class(
+        format_user=user,
+        format_assistant=assistant,
+        format_system=format_system or user,
+        format_function=format_function or FunctionFormatter(assistant.slots),
+        format_observation=format_observation or user,
+        format_tools=format_tools or ToolFormatter(),
+        format_prefix=format_prefix or EmptyFormatter(),
+        default_system=default_system,
+        stop_words=stop_words or [],
+        thought_words=thought_words or ("<think>\n", "\n</think>\n\n"),
+        tool_call_words=tool_call_words or ("<tool_call>", "</tool_call>"),
+        efficient_eos=efficient_eos,
+        replace_eos=replace_eos,
+        replace_jinja_template=replace_jinja_template,
+        enable_thinking=enable_thinking,
+        mm_plugin=mm_plugin or get_mm_plugin("base"),
+    )
 
 
 def get_template_and_fix_tokenizer(tokenizer: Any, data_args: Any) -> Template:
     name = data_args.template or "empty"
     if name not in TEMPLATES:
-        supported = ", ".join(sorted(TEMPLATES))
-        raise ValueError(f"Template {name!r} was removed from this LLaVA-only build. Supported: {supported}.")
-
-    template = TEMPLATES[name].clone()
+        raise ValueError(f"Template {name!r} is not kept in this simplified build. Available: {sorted(TEMPLATES)}")
+    template = deepcopy(TEMPLATES[name])
     if data_args.default_system is not None:
         template.default_system = data_args.default_system
-    if getattr(data_args, "tool_format", None) is not None:
-        raise ValueError("Tool/function-call formatting was removed from this SFT-only project.")
-
+    if data_args.tool_format is not None:
+        logger.warning_rank0("tool_format=%s is treated as plain text in this train-only simplified build.", data_args.tool_format)
+    if isinstance(template, ReasoningTemplate):
+        template.enable_thinking = data_args.enable_thinking
     template.fix_special_tokens(tokenizer)
+    template.fix_jinja_template(tokenizer)
     return template
+
+
+def _chatml_plugin(name: str, plugin: BasePlugin | None = None, default_system: str = "You are a helpful assistant.", reasoning: bool = False) -> None:
+    register_template(
+        name=name,
+        format_user=StringFormatter(["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]),
+        format_assistant=StringFormatter(["{{content}}<|im_end|>\n"]),
+        format_system=StringFormatter(["<|im_start|>system\n{{content}}<|im_end|>\n"]),
+        default_system=default_system,
+        stop_words=["<|im_end|>"],
+        replace_eos=True,
+        mm_plugin=plugin,
+        template_class=ReasoningTemplate if reasoning else Template,
+    )
+
+
+register_template("empty", format_assistant=StringFormatter(["{{content}}"]))
+register_template(
+    "default",
+    format_user=StringFormatter(["Human: {{content}}", {"eos_token"}, "\nAssistant:"]),
+    format_assistant=StringFormatter(["{{content}}", {"eos_token"}, "\n"]),
+    format_system=StringFormatter(["System: {{content}}", {"eos_token"}, "\n"]),
+)
+
+_llava_system = "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions."
+register_template("llava", format_user=StringFormatter(["USER: {{content}} ASSISTANT:"]), default_system=_llava_system, mm_plugin=get_mm_plugin("llava", image_token="<image>"))
+register_template("llava_next", format_user=StringFormatter(["USER: {{content}} ASSISTANT:"]), default_system=_llava_system, mm_plugin=get_mm_plugin("llava_next", image_token="<image>"))
+register_template("llava_next_video", format_user=StringFormatter(["USER: {{content}} ASSISTANT:"]), default_system=_llava_system, mm_plugin=get_mm_plugin("llava_next_video", image_token="<image>", video_token="<video>"))
+_chatml_plugin("llava_next_qwen", get_mm_plugin("llava_next", image_token="<image>"), default_system="You are a helpful assistant.")
+register_template(
+    "llava_next_llama3",
+    format_user=StringFormatter(["<|start_header_id|>user<|end_header_id|>\n\n{{content}}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"]),
+    format_assistant=StringFormatter(["{{content}}<|eot_id|>"]),
+    format_system=StringFormatter(["<|start_header_id|>system<|end_header_id|>\n\n{{content}}<|eot_id|>"]),
+    format_prefix=EmptyFormatter([{"bos_token"}]),
+    stop_words=["<|eot_id|>", "<|eom_id|>"],
+    replace_eos=True,
+    mm_plugin=get_mm_plugin("llava_next", image_token="<image>"),
+)
+register_template(
+    "llava_next_mistral",
+    format_user=StringFormatter(["[INST] {{content}}[/INST]"]),
+    format_assistant=StringFormatter([" {{content}}", {"eos_token"}]),
+    format_system=StringFormatter(["{{content}}\n\n"]),
+    format_prefix=EmptyFormatter([{"bos_token"}]),
+    mm_plugin=get_mm_plugin("llava_next", image_token="<image>"),
+)
+
+_chatml_plugin("qwen", default_system="You are Qwen, created by Alibaba Cloud. You are a helpful assistant.")
+_chatml_plugin("qwen3", reasoning=True)
+_chatml_plugin("qwen3_nothink")
+_chatml_plugin("qwen2_vl", get_mm_plugin("qwen2_vl", image_token="<|image_pad|>", video_token="<|video_pad|>"))
+_chatml_plugin("qwen3_vl", get_mm_plugin("qwen3_vl", image_token="<|image_pad|>", video_token="<|video_pad|>"), default_system="", reasoning=True)
+_chatml_plugin("qwen3_vl_nothink", get_mm_plugin("qwen3_vl", image_token="<|image_pad|>", video_token="<|video_pad|>"), default_system="")
+_chatml_plugin("qwen3_5", get_mm_plugin("qwen3_vl", image_token="<|image_pad|>", video_token="<|video_pad|>"), default_system="", reasoning=True)
+_chatml_plugin("qwen3_5_nothink", get_mm_plugin("qwen3_vl", image_token="<|image_pad|>", video_token="<|video_pad|>"), default_system="")
+_chatml_plugin("qwen2_audio", get_mm_plugin("qwen2_audio", audio_token="<|AUDIO|>"))
+_chatml_plugin("qwen2_omni", get_mm_plugin("qwen2_omni", image_token="<|IMAGE|>", video_token="<|VIDEO|>", audio_token="<|AUDIO|>", vision_bos_token="<|vision_bos|>", vision_eos_token="<|vision_eos|>", audio_bos_token="<|audio_bos|>", audio_eos_token="<|audio_eos|>"))
+
+_chatml_plugin(
+    "intern_vl",
+    get_mm_plugin("intern_vl", image_token="<image>", video_token="<video>"),
+    default_system="你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。",
+)
+_chatml_plugin("intern_s1", get_mm_plugin("intern_vl", image_token="<image>", video_token="<video>"), default_system="")
+
+register_template(
+    "kimi_vl",
+    format_user=StringFormatter(["<|im_user|>user<|im_middle|>{{content}}<|im_end|><|im_assistant|>assistant<|im_middle|>"]),
+    format_assistant=StringFormatter(["{{content}}<|im_end|>"]),
+    format_system=StringFormatter(["<|im_system|>system<|im_middle|>{{content}}<|im_end|>"]),
+    default_system="You are a helpful assistant",
+    stop_words=["<|im_end|>"],
+    thought_words=("◁think▷", "◁/think▷"),
+    mm_plugin=get_mm_plugin("kimi_vl", image_token="<|media_pad|>"),
+    template_class=ReasoningTemplate,
+)

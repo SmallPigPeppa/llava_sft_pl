@@ -1,365 +1,420 @@
 from __future__ import annotations
 
+import bisect
 import json
 import os
 import random
+from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import dataclass
-from typing import Any, Iterable
+from dataclasses import asdict, dataclass
+from typing import Any, Iterable, Literal, Optional
 
 import numpy as np
-import torch
 from datasets import DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-try:  # match either Lightning package name
-    from lightning.pytorch import LightningDataModule
+try:
+    from lightning import LightningDataModule
 except Exception:  # pragma: no cover
-    from pytorch_lightning import LightningDataModule
+    from lightning.pytorch import LightningDataModule  # type: ignore
 
-from .template import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, VIDEO_PLACEHOLDER, Template
+from ..extras import DATA_CONFIG, IGNORE_INDEX, IMAGE_PLACEHOLDER, get_logger, has_tokenized_data
+from .collator import SFTDataCollatorWith4DAttentionMask
+from .template import Role
 
-DATA_CONFIG = "dataset_info.json"
+logger = get_logger(__name__)
+MAX_SU_SEQ_IDX = 2**32
 
 
 def _get_attr(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
-def _rank0() -> bool:
-    try:
-        import torch.distributed as dist
-
-        return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
-    except Exception:
-        return True
-
-
-def _log(message: str) -> None:
-    if _rank0():
-        print(message)
-
-
-def _has_tokenized_data(path: str | os.PathLike[str] | None) -> bool:
-    return bool(path) and os.path.isdir(path) and len(os.listdir(path)) > 0
-
-
-def _load_jsonish(value: Any) -> Any:
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return value
-    return value
-
-
-def _as_list(value: Any) -> list[Any] | None:
-    value = _load_jsonish(value)
-    if value is None:
-        return None
-    if isinstance(value, np.ndarray):
-        value = value.tolist()
-    return value if isinstance(value, list) else [value]
-
-
-def _resolve_media(media: Any, media_dir: str | None) -> Any:
-    if isinstance(media, str):
-        candidate = os.path.join(media_dir or "", media) if media_dir and not os.path.isabs(media) else media
-        return candidate if os.path.isfile(candidate) else media
-    if isinstance(media, dict) and media.get("path") is not None:
-        path = str(media["path"])
-        candidate = os.path.join(media_dir or "", path) if media_dir and not os.path.isabs(path) else path
-        if os.path.isfile(candidate):
-            media = dict(media)
-            media["path"] = candidate
-    return media
-
-
-def _resolve_media_list(value: Any, media_dir: str | None) -> list[Any] | None:
-    items = _as_list(value)
-    if not items:
-        return None
-    return [_resolve_media(item, media_dir) for item in items]
-
-
-def _infer_seqlen(source_len: int, target_len: int, cutoff_len: int) -> tuple[int, int]:
-    if target_len * 2 < cutoff_len:
-        max_target_len = cutoff_len
-    elif source_len * 2 < cutoff_len:
-        max_target_len = cutoff_len - source_len
-    else:
-        max_target_len = int(cutoff_len * (target_len / max(1, source_len + target_len)))
-    new_target_len = min(max_target_len, target_len)
-    new_source_len = min(max(cutoff_len - new_target_len, 0), source_len)
-    return new_source_len, new_target_len
-
-
 @dataclass
 class DatasetAttr:
+    load_from: Literal["file"]
     dataset_name: str
+    formatting: Literal["sharegpt"] = "sharegpt"
+    ranking: bool = False
     split: str = "train"
     num_samples: int | None = None
-
-    messages: str = "conversations"
     system: str | None = None
     tools: str | None = None
     images: str | None = None
     videos: str | None = None
     audios: str | None = None
-
-    role_tag: str = "from"
-    content_tag: str = "value"
-    user_tag: str = "human"
-    assistant_tag: str = "gpt"
-    observation_tag: str = "observation"
-    function_tag: str = "function_call"
-    system_tag: str = "system"
+    messages: str | None = "conversations"
+    role_tag: str | None = "from"
+    content_tag: str | None = "value"
+    user_tag: str | None = "human"
+    assistant_tag: str | None = "gpt"
+    observation_tag: str | None = "observation"
+    function_tag: str | None = "function_call"
+    system_tag: str | None = "system"
 
     def __repr__(self) -> str:
         return self.dataset_name
 
-    @classmethod
-    def from_info(cls, name: str, info: dict[str, Any]) -> "DatasetAttr":
-        if info.get("formatting", "sharegpt") != "sharegpt":
-            raise ValueError("Only ShareGPT/LLaVA SFT data is kept in this slim project.")
-        if info.get("ranking", False):
-            raise ValueError("Ranking/DPO data was removed; use ShareGPT SFT data.")
-        if "file_name" not in info:
-            raise ValueError(f"Dataset {name!r} must define `file_name` in {DATA_CONFIG}.")
-
-        attr = cls(
-            dataset_name=info["file_name"],
-            split=info.get("split", "train"),
-            num_samples=info.get("num_samples"),
-        )
+    def join(self, info: dict[str, Any]) -> None:
+        self.formatting = info.get("formatting", "sharegpt")
+        if self.formatting != "sharegpt":
+            raise ValueError("Only ShareGPT/LLaVA-style SFT datasets are kept.")
+        self.ranking = bool(info.get("ranking", False))
+        if self.ranking:
+            raise ValueError("Ranking/DPO-style datasets were removed; use standard ShareGPT SFT data.")
+        self.split = info.get("split", "train")
+        self.num_samples = info.get("num_samples")
+        columns = info.get("columns", {})
+        tags = info.get("tags", {})
         for key in ["messages", "system", "tools", "images", "videos", "audios"]:
-            if key in info.get("columns", {}):
-                setattr(attr, key, info["columns"][key])
-        for key in [
-            "role_tag",
-            "content_tag",
-            "user_tag",
-            "assistant_tag",
-            "observation_tag",
-            "function_tag",
-            "system_tag",
-        ]:
-            if key in info.get("tags", {}):
-                setattr(attr, key, info["tags"][key])
-        return attr
+            if key in columns:
+                setattr(self, key, columns[key])
+        for key in ["role_tag", "content_tag", "user_tag", "assistant_tag", "observation_tag", "function_tag", "system_tag"]:
+            if key in tags:
+                setattr(self, key, tags[key])
 
 
-def _dataset_attrs(dataset_names: list[str], dataset_dir: str | dict[str, Any]) -> list[DatasetAttr]:
+def get_dataset_list(dataset_names: list[str] | None, dataset_dir: str | dict[str, Any]) -> list[DatasetAttr]:
+    if not dataset_names:
+        return []
     if isinstance(dataset_dir, dict):
         dataset_info = dataset_dir
     else:
-        config_path = os.path.join(dataset_dir, DATA_CONFIG)
-        if not os.path.isfile(config_path):
-            # Allow direct parquet path(s) without dataset_info.json.
-            return [DatasetAttr(dataset_name=name) for name in dataset_names]
-        with open(config_path, "r", encoding="utf-8") as f:
-            dataset_info = json.load(f)
+        path = os.path.join(dataset_dir, DATA_CONFIG)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                dataset_info = json.load(f)
+        except Exception as exc:
+            raise ValueError(f"Cannot open {path}: {exc}") from exc
 
-    attrs = []
+    attrs: list[DatasetAttr] = []
     for name in dataset_names:
         if name not in dataset_info:
-            # Convenience fallback for direct local paths mixed with dataset_info configs.
-            path = os.path.join(str(dataset_dir), name)
-            if os.path.exists(path) or os.path.exists(name):
-                attrs.append(DatasetAttr(dataset_name=name))
-                continue
-            raise ValueError(f"Undefined dataset {name!r} in {DATA_CONFIG}.")
-        attrs.append(DatasetAttr.from_info(name, dataset_info[name]))
+            raise ValueError(f"Undefined dataset {name} in {DATA_CONFIG}.")
+        item = dataset_info[name]
+        if "file_name" not in item:
+            raise ValueError(f"Dataset {name} must define `file_name` in {DATA_CONFIG}.")
+        attr = DatasetAttr("file", dataset_name=item["file_name"])
+        attr.join(item)
+        attrs.append(attr)
     return attrs
 
 
-def _collect_parquet_files(dataset_dir: str, dataset_name: str) -> list[str]:
-    local_path = os.path.join(dataset_dir, dataset_name)
-    if os.path.isdir(local_path):
-        files = []
-        for root, _, filenames in os.walk(local_path):
-            for filename in sorted(filenames):
-                path = os.path.join(root, filename)
-                if filename.endswith(".parquet"):
-                    files.append(path)
-                elif filename.startswith(".") or filename.startswith("_"):
-                    continue
-                else:
-                    raise ValueError(f"Only parquet files are supported, found {path!r}.")
-    elif os.path.isfile(local_path):
-        if not local_path.endswith(".parquet"):
-            raise ValueError(f"Only parquet files are supported, found {local_path!r}.")
-        files = [local_path]
-    else:
-        raise ValueError(f"Parquet file or directory not found: {local_path}")
-
-    if not files:
-        raise ValueError(f"No parquet files found under {local_path}.")
-    return files
+def _merge_datasets(datasets: list[Any], data_args: Any) -> Any:
+    if not datasets:
+        raise ValueError("No train dataset was loaded.")
+    if len(datasets) == 1:
+        return datasets[0]
+    if _get_attr(data_args, "mix_strategy", "concat") != "concat":
+        raise ValueError("This simplified DataModule only supports data.mix_strategy='concat'.")
+    return concatenate_datasets(datasets)
 
 
-def _convert_sharegpt(example: dict[str, Any], attr: DatasetAttr, media_dir: str | None) -> dict[str, Any]:
-    raw_messages = _load_jsonish(example[attr.messages])
-    if not isinstance(raw_messages, list):
-        raise TypeError(f"ShareGPT messages must be a list, got {type(raw_messages)!r}.")
-
-    role_map = {
-        attr.user_tag: "user",
-        attr.assistant_tag: "assistant",
-        attr.observation_tag: "observation",
-        attr.function_tag: "function",
-        attr.system_tag: "system",
-    }
-    if raw_messages and raw_messages[0].get(attr.role_tag) == attr.system_tag:
-        system = raw_messages[0].get(attr.content_tag, "")
-        raw_messages = raw_messages[1:]
-    else:
-        system = example.get(attr.system, "") if attr.system else ""
-
-    aligned: list[dict[str, str]] = []
-    valid = True
-    for i, message in enumerate(raw_messages):
-        raw_role = message.get(attr.role_tag)
-        role = role_map.get(raw_role)
-        expected = {"user", "observation"} if i % 2 == 0 else {"assistant", "function"}
-        if role not in expected:
-            valid = False
-            break
-        aligned.append({"role": "user" if role == "observation" else "assistant" if role == "function" else role, "content": str(message.get(attr.content_tag, ""))})
-
-    if not valid or len(aligned) < 2 or len(aligned) % 2 != 0:
-        prompt, response = [], []
-    else:
-        prompt, response = aligned[:-1], aligned[-1:]
-
-    images = _resolve_media_list(example.get(attr.images), media_dir) if attr.images else None
-    videos = _resolve_media_list(example.get(attr.videos), media_dir) if attr.videos else None
-    audios = _resolve_media_list(example.get(attr.audios), media_dir) if attr.audios else None
-
-    if images:
-        placeholder_count = sum(m["content"].count(IMAGE_PLACEHOLDER) for m in prompt + response)
-        missing = max(0, len(images) - placeholder_count)
-        if missing:
-            for message in prompt:
-                if message["role"] == "user":
-                    message["content"] = (IMAGE_PLACEHOLDER + "\n") * missing + message["content"]
-                    break
-    if videos and not any(VIDEO_PLACEHOLDER in m["content"] for m in prompt + response):
-        raise ValueError("Video columns are present, but video preprocessing was removed from this slim build.")
-    if audios and not any(AUDIO_PLACEHOLDER in m["content"] for m in prompt + response):
-        raise ValueError("Audio columns are present, but audio preprocessing was removed from this slim build.")
-
-    tools = example.get(attr.tools, "") if attr.tools else ""
-    if isinstance(tools, (dict, list)):
-        tools = json.dumps(tools, ensure_ascii=False)
-
-    return {"_prompt": prompt, "_response": response, "_system": system, "_tools": tools, "_images": images, "_videos": videos, "_audios": audios}
-
-
-def _pad_to_multiple(length: int, multiple: int | None) -> int:
-    if not multiple:
-        return length
-    return ((length + multiple - 1) // multiple) * multiple
+def _train_split(dataset: Any) -> Any:
+    if isinstance(dataset, DatasetDict):
+        if "train" not in dataset:
+            raise ValueError("Tokenized dataset does not contain a train split.")
+        return dataset["train"]
+    return dataset
 
 
 @dataclass
-class SFTProcessor:
-    template: Template
-    tokenizer: Any
-    processor: Any
+class ShareGPTConverter:
+    attr: DatasetAttr
     data_args: Any
 
-    def preprocess_batch(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
-        model_inputs: dict[str, list[Any]] = {"input_ids": [], "attention_mask": [], "labels": [], "images": [], "videos": [], "audios": []}
+    def _resolve_media(self, media: Any) -> Any:
+        if isinstance(media, str):
+            candidate = os.path.join(self.data_args.media_dir, media) if not os.path.isabs(media) else media
+            return candidate if os.path.isfile(candidate) else media
+        if isinstance(media, dict) and media.get("path") is not None:
+            path = str(media["path"])
+            candidate = os.path.join(self.data_args.media_dir, path) if not os.path.isabs(path) else path
+            return {**media, "path": candidate} if os.path.isfile(candidate) else media
+        if isinstance(media, list):
+            return [self._resolve_media(x) for x in media]
+        return media
+
+    def _media_list(self, value: Any) -> list[Any] | None:
+        if value is None:
+            return None
+        items = value if isinstance(value, list) else [value]
+        return [self._resolve_media(item) for item in items] or None
+
+    @staticmethod
+    def _load_messages(raw: Any) -> list[dict[str, Any]]:
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        if not isinstance(raw, list):
+            raise TypeError(f"ShareGPT messages must be a list, got {type(raw)!r}.")
+        return raw
+
+    def __call__(self, example: dict[str, Any]) -> dict[str, Any]:
+        attr = self.attr
+        messages = self._load_messages(example[attr.messages])
+        role_map = {
+            attr.user_tag: Role.USER.value,
+            attr.assistant_tag: Role.ASSISTANT.value,
+            attr.observation_tag: Role.OBSERVATION.value,
+            attr.function_tag: Role.FUNCTION.value,
+            attr.system_tag: Role.SYSTEM.value,
+        }
+        if attr.system_tag and messages and messages[0][attr.role_tag] == attr.system_tag:
+            system = messages[0][attr.content_tag]
+            messages = messages[1:]
+        else:
+            system = example[attr.system] if attr.system else ""
+
+        aligned, broken = [], False
+        for turn_idx, message in enumerate(messages):
+            role = message[attr.role_tag]
+            expected = (attr.user_tag, attr.observation_tag) if turn_idx % 2 == 0 else (attr.assistant_tag, attr.function_tag)
+            if role not in expected:
+                logger.warning_rank0("Invalid role tag in %s", messages)
+                broken = True
+                break
+            aligned.append({"role": role_map[role], "content": message[attr.content_tag]})
+        if len(aligned) % 2 != 0:
+            logger.warning_rank0("Invalid message count in %s", messages)
+            broken = True
+
+        prompt, response = ([], []) if broken else (aligned[:-1], aligned[-1:])
+        images = self._media_list(example[attr.images]) if attr.images else None
+        if images:
+            placeholders = sum(m["content"].count(IMAGE_PLACEHOLDER) for m in prompt + response)
+            missing = max(0, len(images) - placeholders)
+            if missing:
+                for message in prompt:
+                    if message["role"] == Role.USER.value:
+                        message["content"] = (IMAGE_PLACEHOLDER + "\n") * missing + message["content"]
+                        break
+
+        tools = example[attr.tools] if attr.tools else ""
+        if isinstance(tools, (dict, list)):
+            tools = json.dumps(tools, ensure_ascii=False)
+        return {
+            "_prompt": prompt,
+            "_response": response,
+            "_system": system,
+            "_tools": tools,
+            "_images": images,
+            "_videos": self._media_list(example[attr.videos]) if attr.videos else None,
+            "_audios": self._media_list(example[attr.audios]) if attr.audios else None,
+        }
+
+
+def _align_dataset(dataset: Any, attr: DatasetAttr, data_args: Any, training_args: Any) -> Any:
+    column_names = list(next(iter(dataset)).keys())
+    kwargs = dict(
+        num_proc=data_args.preprocessing_num_workers,
+        load_from_cache_file=(not data_args.overwrite_cache) or (_get_attr(training_args, "local_process_index", 0) != 0),
+        desc="Converting ShareGPT format",
+    )
+    return dataset.map(ShareGPTConverter(attr, data_args), batched=False, remove_columns=column_names, **kwargs)
+
+
+def infer_seqlen(source_len: int, target_len: int, cutoff_len: int) -> tuple[int, int]:
+    if target_len * 2 < cutoff_len:
+        max_target_len = cutoff_len
+    elif source_len * 2 < cutoff_len:
+        max_target_len = cutoff_len - source_len
+    else:
+        max_target_len = int(cutoff_len * (target_len / (source_len + target_len)))
+    new_target_len = min(max_target_len, target_len)
+    return min(max(cutoff_len - new_target_len, 0), source_len), new_target_len
+
+
+def greedy_knapsack(lengths: list[int], capacity: int) -> list[list[int]]:
+    lengths = sorted(lengths)
+    packs: list[list[int]] = []
+    while lengths:
+        pack, remaining = [], capacity
+        while True:
+            index = bisect.bisect(lengths, remaining) - 1
+            if index < 0:
+                break
+            remaining -= lengths[index]
+            pack.append(lengths.pop(index))
+        packs.append(pack)
+    return packs
+
+
+@dataclass
+class SupervisedDatasetProcessor:
+    template: Any
+    tokenizer: Any
+    processor: Any | None
+    data_args: Any
+
+    def _encode_example(self, prompt: list[dict[str, str]], response: list[dict[str, str]], system: str | None, tools: str | None, images: list[Any], videos: list[Any], audios: list[Any]) -> tuple[list[int], list[int]]:
+        messages = self.template.mm_plugin.process_messages(prompt + response, images, videos, audios, self.processor)
+        input_ids, labels = self.template.mm_plugin.process_token_ids([], [], images, videos, audios, self.tokenizer, self.processor)
+        pairs = self.template.encode_multiturn(self.tokenizer, messages, system, tools)
+        total_length = len(input_ids) + (1 if self.template.efficient_eos else 0)
+        if self.data_args.mask_history:
+            pairs = pairs[::-1]
+
+        for turn_idx, (source_ids, target_ids) in enumerate(pairs):
+            if total_length >= self.data_args.cutoff_len:
+                break
+            source_len, target_len = infer_seqlen(len(source_ids), len(target_ids), self.data_args.cutoff_len - total_length)
+            source_ids, target_ids = source_ids[:source_len], target_ids[:target_len]
+            total_length += source_len + target_len
+            if self.data_args.train_on_prompt:
+                source_label = source_ids
+            elif self.template.efficient_eos and turn_idx != 0:
+                source_label = [self.tokenizer.eos_token_id] + [IGNORE_INDEX] * (source_len - 1)
+            else:
+                source_label = [IGNORE_INDEX] * source_len
+            target_label = [IGNORE_INDEX] * target_len if self.data_args.mask_history and turn_idx != 0 else target_ids
+            if self.data_args.mask_history:
+                input_ids = source_ids + target_ids + input_ids
+                labels = source_label + target_label + labels
+            else:
+                input_ids += source_ids + target_ids
+                labels += source_label + target_label
+
+        if self.template.efficient_eos:
+            input_ids.append(self.tokenizer.eos_token_id)
+            labels.append(self.tokenizer.eos_token_id)
+        return input_ids, labels
+
+    def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
+        model_inputs = defaultdict(list)
         for i in range(len(examples["_prompt"])):
-            prompt = examples["_prompt"][i]
-            response = examples["_response"][i]
-            if len(prompt) % 2 != 1 or len(response) != 1:
+            if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
+                logger.warning_rank0("Dropped invalid example: %s", examples["_prompt"][i] + examples["_response"][i])
                 continue
-
-            images = examples["_images"][i] or []
-            videos = examples["_videos"][i] or []
-            audios = examples["_audios"][i] or []
-            messages = self.template.process_messages(prompt + response, images, videos, audios, self.processor)
-            pairs = self.template.encode_multiturn(self.tokenizer, messages, examples["_system"][i], examples["_tools"][i])
-
-            input_ids: list[int] = []
-            labels: list[int] = []
-            total = 1 if self.template.efficient_eos else 0
-            pairs_to_encode = list(reversed(pairs)) if self.data_args.mask_history else pairs
-
-            for turn_idx, (source_ids, target_ids) in enumerate(pairs_to_encode):
-                if total >= self.data_args.cutoff_len:
-                    break
-                source_len, target_len = _infer_seqlen(len(source_ids), len(target_ids), self.data_args.cutoff_len - total)
-                source_ids, target_ids = source_ids[:source_len], target_ids[:target_len]
-                source_labels = source_ids if self.data_args.train_on_prompt else [IGNORE_INDEX] * source_len
-                target_labels = [IGNORE_INDEX] * target_len if self.data_args.mask_history and turn_idx != 0 else target_ids
-                if self.data_args.mask_history:
-                    input_ids = source_ids + target_ids + input_ids
-                    labels = source_labels + target_labels + labels
-                else:
-                    input_ids.extend(source_ids + target_ids)
-                    labels.extend(source_labels + target_labels)
-                total += source_len + target_len
-
-            if self.template.efficient_eos and self.tokenizer.eos_token_id is not None:
-                input_ids.append(self.tokenizer.eos_token_id)
-                labels.append(self.tokenizer.eos_token_id)
-
+            input_ids, labels = self._encode_example(
+                examples["_prompt"][i],
+                examples["_response"][i],
+                examples["_system"][i],
+                examples["_tools"][i],
+                examples["_images"][i] or [],
+                examples["_videos"][i] or [],
+                examples["_audios"][i] or [],
+            )
             model_inputs["input_ids"].append(input_ids)
             model_inputs["attention_mask"].append([1] * len(input_ids))
             model_inputs["labels"].append(labels)
-            model_inputs["images"].append(images or None)
-            model_inputs["videos"].append(None)
-            model_inputs["audios"].append(None)
+            model_inputs["images"].append(examples["_images"][i])
+            model_inputs["videos"].append(examples["_videos"][i])
+            model_inputs["audios"].append(examples["_audios"][i])
         return model_inputs
 
-    def print_example(self, example: dict[str, Any]) -> None:
-        valid_labels = [x for x in example["labels"] if x != IGNORE_INDEX]
+    def print_data_example(self, example: dict[str, list[int]]) -> None:
+        labels = [x for x in example["labels"] if x != IGNORE_INDEX]
         print("input_ids:\n{}".format(example["input_ids"]))
         print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
         print("label_ids:\n{}".format(example["labels"]))
-        print("labels:\n{}".format(self.tokenizer.decode(valid_labels, skip_special_tokens=False)))
+        print("labels:\n{}".format(self.tokenizer.decode(labels, skip_special_tokens=False)))
 
 
 @dataclass
-class SFTCollator:
-    tokenizer: Any
-    processor: Any
-    template: Template
-    label_pad_token_id: int = IGNORE_INDEX
-    pad_to_multiple_of: int = 8
-
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        max_len = _pad_to_multiple(max(len(f["input_ids"]) for f in features), self.pad_to_multiple_of)
-        input_ids, attention_mask, labels = [], [], []
-        flat_images: list[Any] = []
-        for feature in features:
-            pad_len = max_len - len(feature["input_ids"])
-            input_ids.append(feature["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
-            attention_mask.append(feature["attention_mask"] + [0] * pad_len)
-            labels.append(feature["labels"] + [self.label_pad_token_id] * pad_len)
-            flat_images.extend(feature.get("images") or [])
-            if feature.get("videos"):
-                raise ValueError("Video preprocessing was removed from this slim build.")
-            if feature.get("audios"):
-                raise ValueError("Audio preprocessing was removed from this slim build.")
-
-        batch: dict[str, Any] = {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-        }
-        if flat_images:
-            batch.update(self.template.image_inputs(flat_images, self.processor))
-        return batch
+class PackingParams:
+    sequence_boundaries: list[int]
+    image_subseq_ids: list[int]
+    video_subseq_ids: list[int]
+    audio_subseq_ids: list[int]
+    right_padding_length: int
 
 
 @dataclass
-class _OnlineTokenizedDataset(IterableDataset):
+class PackedSupervisedDatasetProcessor(SupervisedDatasetProcessor):
+    def preprocess_dataset(self, examples: dict[str, list[Any]]) -> dict[str, list[Any]]:
+        encoded, lengths = [], []
+        for i in range(len(examples["_prompt"])):
+            if len(examples["_prompt"][i]) % 2 != 1 or len(examples["_response"][i]) != 1:
+                continue
+            input_ids, labels = self._encode_example(
+                examples["_prompt"][i], examples["_response"][i], examples["_system"][i], examples["_tools"][i],
+                examples["_images"][i] or [], examples["_videos"][i] or [], examples["_audios"][i] or []
+            )
+            if len(input_ids) <= self.data_args.cutoff_len:
+                encoded.append((input_ids, labels, examples["_images"][i] or [], examples["_videos"][i] or [], examples["_audios"][i] or []))
+                lengths.append(len(input_ids))
+            else:
+                logger.warning_rank0("Dropped lengthy example with length %s > %s.", len(input_ids), self.data_args.cutoff_len)
+
+        by_len: dict[int, list[int]] = defaultdict(list)
+        for idx, length in enumerate(lengths):
+            by_len[length].append(idx)
+
+        model_inputs = defaultdict(list)
+        for pack in greedy_knapsack(lengths, self.data_args.cutoff_len):
+            packed_ids, packed_labels, packed_images, packed_videos, packed_audios = [], [], [], [], []
+            packed_mask, packed_pos = [], []
+            boundaries = [0]
+            image_subseq_ids: list[int] = []
+            video_subseq_ids: list[int] = []
+            audio_subseq_ids: list[int] = []
+            for subseq_idx, length in enumerate(pack):
+                idx = by_len[length].pop()
+                ids, labels, images, videos, audios = encoded[idx]
+                packed_ids += ids
+                packed_labels += labels
+                packed_pos += list(range(len(ids)))
+                packed_mask += ([subseq_idx + 1] if self.data_args.neat_packing else [1]) * len(ids)
+                packed_images += images
+                packed_videos += videos
+                packed_audios += audios
+                boundaries.append(boundaries[-1] + len(ids))
+                image_subseq_ids += [subseq_idx] * len(images)
+                video_subseq_ids += [subseq_idx] * len(videos)
+                audio_subseq_ids += [subseq_idx] * len(audios)
+
+            pad_len = self.data_args.cutoff_len - len(packed_ids) + 1
+            if pad_len > 0:
+                packed_ids += [self.tokenizer.pad_token_id] * pad_len
+                packed_labels += [IGNORE_INDEX] * pad_len
+                packed_pos += [0] * pad_len
+                packed_mask += ([0] if self.data_args.neat_packing else [1]) * pad_len
+                boundaries.append(boundaries[-1] + pad_len)
+            if len(packed_ids) != self.data_args.cutoff_len + 1:
+                raise ValueError("The length of packed example should be identical to cutoff_len + 1.")
+
+            model_inputs["input_ids"].append(packed_ids)
+            model_inputs["attention_mask"].append(packed_mask)
+            model_inputs["position_ids"].append(packed_pos)
+            model_inputs["labels"].append(packed_labels)
+            model_inputs["images"].append(packed_images or None)
+            model_inputs["videos"].append(packed_videos or None)
+            model_inputs["audios"].append(packed_audios or None)
+            if self.data_args.neat_packing:
+                model_inputs["packing_params"].append(asdict(PackingParams(boundaries, image_subseq_ids or [MAX_SU_SEQ_IDX], video_subseq_ids or [MAX_SU_SEQ_IDX], audio_subseq_ids or [MAX_SU_SEQ_IDX], pad_len)))
+        return model_inputs
+
+
+def _dataset_processor(data_args: Any, template: Any, tokenizer: Any, processor: Any | None) -> SupervisedDatasetProcessor:
+    cls = PackedSupervisedDatasetProcessor if data_args.packing else SupervisedDatasetProcessor
+    return cls(template=template, tokenizer=tokenizer, processor=processor, data_args=data_args)
+
+
+def _tokenize_dataset(dataset: Any, data_args: Any, training_args: Any, template: Any, tokenizer: Any, processor: Any | None) -> Any:
+    proc = _dataset_processor(data_args, template, tokenizer, processor)
+    column_names = list(next(iter(dataset)).keys())
+    dataset = dataset.map(
+        proc.preprocess_dataset,
+        batched=True,
+        batch_size=data_args.preprocessing_batch_size,
+        remove_columns=column_names,
+        num_proc=data_args.preprocessing_num_workers,
+        load_from_cache_file=(not data_args.overwrite_cache) or (_get_attr(training_args, "local_process_index", 0) != 0),
+        desc="Tokenizing SFT dataset",
+    )
+    if _get_attr(training_args, "should_log", True):
+        try:
+            print("training example:")
+            proc.print_data_example(next(iter(dataset)))
+        except StopIteration as exc:
+            raise RuntimeError("Cannot find valid samples; check the ShareGPT/LLaVA data format.") from exc
+    return dataset
+
+
+@dataclass
+class _OnlineTokenizedIterableDataset(IterableDataset):
     dataset: Any
-    processor: SFTProcessor
+    dataset_processor: SupervisedDatasetProcessor
     preprocessing_batch_size: int
     seed: int
     shuffle: bool = True
@@ -367,97 +422,74 @@ class _OnlineTokenizedDataset(IterableDataset):
     def __post_init__(self) -> None:
         self.epoch = 0
         if self.preprocessing_batch_size <= 0:
-            raise ValueError("preprocessing_batch_size must be > 0.")
+            raise ValueError("`preprocessing_batch_size` should be greater than 0.")
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
 
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = int(epoch)
-
     @staticmethod
-    def _dist() -> tuple[int, int]:
+    def _dist_worker() -> tuple[int, int, int, int]:
+        world_size, rank = 1, 0
         try:
             import torch.distributed as dist
-
             if dist.is_available() and dist.is_initialized():
-                return dist.get_world_size(), dist.get_rank()
+                world_size, rank = dist.get_world_size(), dist.get_rank()
         except Exception:
             pass
-        return 1, 0
+        worker = get_worker_info()
+        return world_size, rank, (worker.num_workers if worker else 1), (worker.id if worker else 0)
 
     @staticmethod
-    def _batchify(rows: list[dict[str, Any]]) -> dict[str, list[Any]]:
-        keys = list(rows[0].keys()) if rows else []
-        return {key: [row.get(key) for row in rows] for key in keys}
+    def _batchify(examples: list[dict[str, Any]]) -> dict[str, list[Any]]:
+        return {key: [example.get(key) for example in examples] for key in examples[0]}
 
-    @staticmethod
-    def _iter_rows(columns: dict[str, list[Any]]) -> Iterable[dict[str, Any]]:
-        if not columns:
+    def _yield_processed(self, examples: list[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+        model_inputs = self.dataset_processor.preprocess_dataset(self._batchify(examples))
+        if not model_inputs:
             return
-        n = len(next(iter(columns.values())))
-        for i in range(n):
-            yield {key: value[i] for key, value in columns.items()}
-
-    def _yield_processed(self, rows: list[dict[str, Any]]) -> Iterable[dict[str, Any]]:
-        yield from self._iter_rows(self.processor.preprocess_batch(self._batchify(rows)))
+        first_key = next(iter(model_inputs))
+        for i in range(len(model_inputs[first_key])):
+            yield {key: value[i] for key, value in model_inputs.items()}
 
     def __iter__(self) -> Iterable[dict[str, Any]]:
         indices = list(range(len(self.dataset)))
         if self.shuffle:
-            rng = random.Random(self.seed + self.epoch)
-            rng.shuffle(indices)
-
-        world, rank = self._dist()
-        worker = get_worker_info()
-        num_workers, worker_id = (worker.num_workers, worker.id) if worker else (1, 0)
-        shards = max(1, world * num_workers)
+            random.Random(self.seed + self.epoch).shuffle(indices)
+        world_size, rank, num_workers, worker_id = self._dist_worker()
+        num_shards = max(1, world_size * num_workers)
         shard_id = rank * num_workers + worker_id
-
-        buf: list[dict[str, Any]] = []
-        for pos, idx in enumerate(indices):
-            if pos % shards != shard_id:
+        buffer: list[dict[str, Any]] = []
+        for position, sample_index in enumerate(indices):
+            if position % num_shards != shard_id:
                 continue
-            buf.append(self.dataset[int(idx)])
-            if len(buf) >= self.preprocessing_batch_size:
-                yield from self._yield_processed(buf)
-                buf = []
-        if buf:
-            yield from self._yield_processed(buf)
+            buffer.append(self.dataset[int(sample_index)])
+            if len(buffer) >= self.preprocessing_batch_size:
+                yield from self._yield_processed(buffer)
+                buffer = []
+        if buffer:
+            yield from self._yield_processed(buffer)
 
 
 class ParquetSFTDataModule(LightningDataModule):
-    """Small parquet-only, ShareGPT/LLaVA-only Lightning DataModule."""
+    """Train-only, parquet-only SFT DataModule with LLaMA-Factory multimodal collate."""
 
-    def __init__(
-        self,
-        template: Template,
-        model_args: Any,
-        data_args: Any,
-        training_args: Any,
-        stage: str,
-        tokenizer: Any,
-        processor: Any = None,
-        model: Any = None,
-        preprocessing_mode: str = "online",
-        train_batch_size: int | None = None,
-        shuffle: bool = True,
-    ) -> None:
+    def __init__(self, template: Any, model_args: Any, data_args: Any, training_args: Any, stage: Literal["sft"], tokenizer: Any, processor: Any | None = None, model: Any | None = None, preprocessing_mode: Literal["offline", "online"] = "offline", train_batch_size: int | None = None, shuffle: bool = True) -> None:
         super().__init__()
         if stage != "sft":
-            raise ValueError("Only stage='sft' is supported.")
-        if preprocessing_mode not in {"online", "offline"}:
-            raise ValueError("preprocessing_mode must be 'online' or 'offline'.")
-        if preprocessing_mode == "offline" and not data_args.tokenized_path:
+            raise ValueError("Only stage='sft' is kept.")
+        if preprocessing_mode not in {"offline", "online"}:
+            raise ValueError("preprocessing_mode must be 'offline' or 'online'.")
+        if data_args.dataset is None:
+            raise ValueError("Please set data.dataset to one or more parquet dataset names or paths.")
+        if preprocessing_mode == "offline" and data_args.tokenized_path is None:
             raise ValueError("Offline preprocessing requires data.tokenized_path.")
-        if not data_args.dataset:
-            raise ValueError("Please set data.dataset.")
-
         self.template = template
         self.model_args = model_args
         self.data_args = data_args
         self.training_args = training_args
-        self.stage = stage
         self.tokenizer = tokenizer
         self.processor = processor
         self.model = model
@@ -467,105 +499,116 @@ class ParquetSFTDataModule(LightningDataModule):
         self.train_dataset = None
         self.data_collator = None
 
-    def _main_process_first(self, desc: str):
+    def _main_first(self, desc: str):
         fn = _get_attr(self.training_args, "main_process_first", None)
         if callable(fn):
-            return fn(desc=desc, local=(not bool(self.data_args.data_shared_file_system)))
+            return fn(desc=desc, local=(not bool(_get_attr(self.data_args, "data_shared_file_system", False))))
         return nullcontext()
 
-    def _load_one(self, attr: DatasetAttr):
-        _log(f"Loading parquet dataset {attr}...")
-        files = _collect_parquet_files(self.data_args.dataset_dir, attr.dataset_name)
+    def _collect_parquet_files(self, attr: DatasetAttr) -> list[str]:
+        if attr.load_from != "file":
+            raise ValueError("Only local parquet files are supported.")
+        local_path = os.path.join(self.data_args.dataset_dir, attr.dataset_name)
+        files: list[str] = []
+        if os.path.isdir(local_path):
+            for root, _, names in os.walk(local_path):
+                for name in sorted(names):
+                    if name.endswith(".parquet"):
+                        files.append(os.path.join(root, name))
+                    elif not (name.startswith(".") or name.startswith("_")):
+                        raise ValueError(f"Only parquet files are allowed, found {os.path.join(root, name)}.")
+        elif os.path.isfile(local_path) and local_path.endswith(".parquet"):
+            files.append(local_path)
+        else:
+            raise ValueError(f"Parquet file or directory {local_path!r} not found.")
+        if not files:
+            raise ValueError(f"No parquet files found under {local_path!r}.")
+        return files
+
+    def _dataset_attrs(self) -> list[DatasetAttr]:
+        try:
+            return get_dataset_list(self.data_args.dataset, self.data_args.dataset_dir)
+        except ValueError as err:
+            attrs: list[DatasetAttr] = []
+            for name in self.data_args.dataset:
+                local_path = os.path.join(self.data_args.dataset_dir, name)
+                if os.path.isdir(local_path) or local_path.endswith(".parquet"):
+                    attrs.append(DatasetAttr("file", dataset_name=name))
+                else:
+                    raise err
+            return attrs
+
+    def _load_one_dataset(self, attr: DatasetAttr) -> Any:
+        logger.info_rank0("Loading parquet dataset %s...", attr)
         dataset = load_dataset(
             path="parquet",
-            data_files=files,
+            data_files=self._collect_parquet_files(attr),
             split=attr.split,
             cache_dir=_get_attr(self.model_args, "cache_dir", None),
             token=_get_attr(self.model_args, "hf_hub_token", None),
             num_proc=_get_attr(self.data_args, "preprocessing_num_workers", None),
         )
         if attr.num_samples is not None:
-            indexes = np.random.permutation(len(dataset))[: int(attr.num_samples)]
+            indexes = np.random.permutation(len(dataset))[: attr.num_samples]
+            if len(indexes) < attr.num_samples:
+                indexes = np.concatenate([indexes, np.random.choice(len(dataset), attr.num_samples - len(indexes))])
             dataset = dataset.select(indexes)
         if self.data_args.max_samples is not None:
-            dataset = dataset.select(range(min(int(self.data_args.max_samples), len(dataset))))
+            dataset = dataset.select(range(min(self.data_args.max_samples, len(dataset))))
+        return _align_dataset(dataset, attr, self.data_args, self.training_args)
 
-        columns = list(next(iter(dataset)).keys())
-        kwargs = dict(
-            num_proc=self.data_args.preprocessing_num_workers,
-            load_from_cache_file=(not self.data_args.overwrite_cache) or (_get_attr(self.training_args, "local_process_index", 0) != 0),
-            desc="Converting ShareGPT parquet",
+    def _load_train_dataset(self) -> Any:
+        return _merge_datasets([self._load_one_dataset(attr) for attr in self._dataset_attrs()], self.data_args)
+
+    def _collator(self) -> SFTDataCollatorWith4DAttentionMask:
+        import torch
+        config = _get_attr(self.model, "config", None)
+        return SFTDataCollatorWith4DAttentionMask(
+            template=self.template,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            pad_to_multiple_of=8,
+            label_pad_token_id=IGNORE_INDEX if self.data_args.ignore_pad_token_for_loss else self.tokenizer.pad_token_id,
+            block_diag_attn=bool(_get_attr(self.model_args, "block_diag_attn", self.data_args.neat_packing)),
+            neat_packing=bool(self.data_args.neat_packing),
+            attn_implementation=_get_attr(config, "_attn_implementation", None),
+            compute_dtype=_get_attr(self.model_args, "compute_dtype", None) or torch.float32,
         )
-        media_dir = self.data_args.media_dir
-        return dataset.map(lambda ex: _convert_sharegpt(ex, attr, media_dir), batched=False, remove_columns=columns, **kwargs)
 
-    def _load_raw_dataset(self):
-        datasets = [self._load_one(attr) for attr in _dataset_attrs(self.data_args.dataset, self.data_args.dataset_dir)]
-        if not datasets:
-            raise ValueError("No dataset was loaded.")
-        if len(datasets) == 1:
-            return datasets[0]
-        merged = concatenate_datasets(datasets)
-        return merged.shuffle(seed=int(_get_attr(self.training_args, "seed", 42)))
-
-    def _build_processor(self) -> SFTProcessor:
-        return SFTProcessor(self.template, self.tokenizer, self.processor, self.data_args)
-
-    def _build_collator(self) -> SFTCollator:
-        pad_id = IGNORE_INDEX if bool(self.data_args.ignore_pad_token_for_loss) else self.tokenizer.pad_token_id
-        return SFTCollator(tokenizer=self.tokenizer, processor=self.processor, template=self.template, label_pad_token_id=pad_id)
-
-    def _build_and_save_offline(self) -> None:
-        with self._main_process_first("build tokenized parquet dataset"):
-            if _has_tokenized_data(self.data_args.tokenized_path):
-                _log(f"Tokenized dataset already exists at {self.data_args.tokenized_path}.")
+    def _build_and_save_offline_dataset(self) -> None:
+        with self._main_first("build tokenized parquet dataset"):
+            if has_tokenized_data(self.data_args.tokenized_path):
+                logger.info_rank0("Tokenized dataset already exists at %s.", self.data_args.tokenized_path)
                 return
-            raw = self._load_raw_dataset()
-            proc = self._build_processor()
-            columns = list(next(iter(raw)).keys())
-            tokenized = raw.map(
-                proc.preprocess_batch,
-                batched=True,
-                batch_size=self.data_args.preprocessing_batch_size,
-                remove_columns=columns,
-                num_proc=self.data_args.preprocessing_num_workers,
-                load_from_cache_file=(not self.data_args.overwrite_cache) or (_get_attr(self.training_args, "local_process_index", 0) != 0),
-                desc="Tokenizing SFT dataset",
-            )
-            DatasetDict({"train": tokenized}).save_to_disk(self.data_args.tokenized_path)
-            _log(f"Tokenized dataset saved at {self.data_args.tokenized_path}.")
+            tokenized = _tokenize_dataset(self._load_train_dataset(), self.data_args, self.training_args, self.template, self.tokenizer, self.processor)
+            if _get_attr(self.training_args, "should_save", True):
+                DatasetDict({"train": tokenized}).save_to_disk(self.data_args.tokenized_path)
+                logger.info_rank0("Tokenized dataset is saved at %s.", self.data_args.tokenized_path)
 
     def prepare_data(self) -> None:
         if self.preprocessing_mode == "offline":
-            self._build_and_save_offline()
+            self._build_and_save_offline_dataset()
 
     def setup(self, stage: str | None = None) -> None:
         if self.train_dataset is not None:
             return
-        self.data_collator = self._build_collator()
+        self.data_collator = self._collator()
         if self.preprocessing_mode == "offline":
-            if not _has_tokenized_data(self.data_args.tokenized_path):
-                self._build_and_save_offline()
-            data = load_from_disk(self.data_args.tokenized_path)
-            self.train_dataset = data["train"] if isinstance(data, DatasetDict) else data
-            _log(f"Loaded tokenized dataset from {self.data_args.tokenized_path}.")
+            if not has_tokenized_data(self.data_args.tokenized_path):
+                self._build_and_save_offline_dataset()
+            self.train_dataset = _train_split(load_from_disk(self.data_args.tokenized_path))
+            logger.info_rank0("Loaded tokenized dataset from %s.", self.data_args.tokenized_path)
         else:
-            with self._main_process_first("load parquet dataset"):
-                raw = self._load_raw_dataset()
-            proc = self._build_processor()
-            self.train_dataset = _OnlineTokenizedDataset(
-                dataset=raw,
-                processor=proc,
-                preprocessing_batch_size=int(self.data_args.preprocessing_batch_size),
-                seed=int(_get_attr(self.training_args, "seed", 42)),
-                shuffle=self.shuffle,
-            )
-            if bool(_get_attr(self.training_args, "should_log", True)):
-                iterator = iter(self.train_dataset)
+            with self._main_first("load parquet dataset"):
+                raw_dataset = self._load_train_dataset()
+            proc = _dataset_processor(self.data_args, self.template, self.tokenizer, self.processor)
+            self.train_dataset = _OnlineTokenizedIterableDataset(raw_dataset, proc, self.data_args.preprocessing_batch_size, int(_get_attr(self.training_args, "seed", 42)), self.shuffle)
+            if _get_attr(self.training_args, "should_log", True):
                 try:
-                    proc.print_example(next(iterator))
+                    proc.print_data_example(next(iter(self.train_dataset)))
                 except StopIteration as exc:
-                    raise RuntimeError("Cannot find valid samples; check the ShareGPT/LLaVA parquet format.") from exc
+                    raise RuntimeError("Cannot find valid samples; check the parquet data format.") from exc
 
     def set_epoch(self, epoch: int) -> None:
         if hasattr(self.train_dataset, "set_epoch"):
@@ -585,18 +628,8 @@ class ParquetSFTDataModule(LightningDataModule):
         )
         if num_workers > 0:
             kwargs["persistent_workers"] = bool(_get_attr(self.training_args, "dataloader_persistent_workers", False))
-            prefetch = _get_attr(self.training_args, "dataloader_prefetch_factor", None)
-            if prefetch is not None:
-                kwargs["prefetch_factor"] = prefetch
+            if _get_attr(self.training_args, "dataloader_prefetch_factor", None) is not None:
+                kwargs["prefetch_factor"] = self.training_args.dataloader_prefetch_factor
         if not isinstance(self.train_dataset, IterableDataset):
             kwargs["shuffle"] = self.shuffle
         return DataLoader(**kwargs)
-
-    def val_dataloader(self):
-        return None
-
-    def test_dataloader(self):
-        return None
-
-    def predict_dataloader(self):
-        return None

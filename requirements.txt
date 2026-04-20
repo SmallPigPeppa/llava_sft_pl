@@ -1,9 +1,0 @@
-torch
-transformers
-peft
-datasets
-lightning
-pyyaml
-pillow
-numpy
-wandb

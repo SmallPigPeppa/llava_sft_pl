@@ -33,7 +33,6 @@ data:
   stage: sft
   cutoff_len: 2048
   max_samples: null
-  val_size: 0.0
   preprocessing_mode: online
   preprocessing_batch_size: 1000
   tokenized_path: null

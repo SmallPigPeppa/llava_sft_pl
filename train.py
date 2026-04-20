@@ -249,7 +249,6 @@ def training_args_kwargs(train_cfg: dict[str, Any], seed: int) -> dict[str, Any]
         "output_dir": str(train_cfg.get("output_dir", "saves/lightning_sft")),
         "overwrite_output_dir": bool(train_cfg.get("overwrite_output_dir", False)),
         "do_train": True,
-        "do_eval": False,
         "per_device_train_batch_size": int(train_cfg.get("per_device_train_batch_size", 1)),
         "gradient_accumulation_steps": int(train_cfg.get("gradient_accumulation_steps", 1)),
         "dataloader_num_workers": int(train_cfg.get("dataloader_num_workers", 0)),
@@ -280,7 +279,6 @@ def build_datamodule(cfg: dict[str, Any], tokenizer: Any, processor: Any, model:
         raise ValueError("This simplified trainer keeps only the LLaMA-Factory SFT data path: set data.stage=sft.")
 
     data_cfg["stage"] = "sft"
-    data_cfg["val_size"] = 0.0
     if data_cfg.get("add_default_system") is False and data_cfg.get("default_system") is None:
         data_cfg["default_system"] = ""
 
@@ -431,8 +429,6 @@ def build_trainer(cfg: dict[str, Any], train_cfg: dict[str, Any]) -> pl.Trainer:
         "logger": build_logger(cfg, train_cfg),
         "enable_checkpointing": False,
         "log_every_n_steps": int(train_cfg.get("logging_steps", 50)),
-        "num_sanity_val_steps": 0,
-        "limit_val_batches": 0,
         "strategy": train_cfg.get("strategy") or "auto",
     }
     if train_cfg.get("gradient_clip_val") is not None:
