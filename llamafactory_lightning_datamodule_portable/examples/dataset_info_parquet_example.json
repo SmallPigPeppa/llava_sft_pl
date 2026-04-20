@@ -1,0 +1,23 @@
+{
+  "my_sft_parquet": {
+    "file_name": "my_sft.parquet",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant"
+    }
+  },
+  "my_pt_parquet": {
+    "file_name": "my_pt.parquet",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "text"
+    }
+  }
+}
