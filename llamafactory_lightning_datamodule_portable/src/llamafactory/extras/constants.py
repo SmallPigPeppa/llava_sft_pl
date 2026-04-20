@@ -14,16 +14,7 @@
 
 import os
 from collections import OrderedDict, defaultdict
-# from enum import StrEnum, unique
-
-try:
-    from enum import StrEnum, unique
-except ImportError:
-    from enum import Enum, unique
-
-    class StrEnum(str, Enum):
-        def __str__(self):
-            return self.value
+from enum import StrEnum, unique
 
 from peft.utils import SAFETENSORS_WEIGHTS_NAME as SAFE_ADAPTER_WEIGHTS_NAME
 from peft.utils import WEIGHTS_NAME as ADAPTER_WEIGHTS_NAME

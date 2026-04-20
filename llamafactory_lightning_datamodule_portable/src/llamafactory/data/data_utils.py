@@ -13,15 +13,7 @@
 # limitations under the License.
 
 import json
-# from enum import StrEnum, unique
-try:
-    from enum import StrEnum, unique
-except ImportError:
-    from enum import Enum, unique
-
-    class StrEnum(str, Enum):
-        def __str__(self):
-            return self.value
+from enum import StrEnum, unique
 from typing import TYPE_CHECKING, Any, Optional, TypedDict, Union
 
 import fsspec
