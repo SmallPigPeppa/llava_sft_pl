@@ -44,16 +44,7 @@ from .data_utils import get_dataset_module, merge_dataset
 from .loader import _get_dataset_processor, _get_preprocessed_dataset
 from .parser import DatasetAttr, get_dataset_list
 
-try:  # keep lightning as an optional dependency of the data package
-    from lightning.pytorch import LightningDataModule
-except Exception:  # pragma: no cover - depends on user's lightning package
-    try:
-        from pytorch_lightning import LightningDataModule  # type: ignore
-    except Exception:  # pragma: no cover
-
-        class LightningDataModule:  # type: ignore[no-redef]
-            pass
-
+from lightning import  LightningDataModule
 
 if TYPE_CHECKING:
     from datasets import Dataset
