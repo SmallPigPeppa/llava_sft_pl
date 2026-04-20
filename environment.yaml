@@ -22,7 +22,7 @@ dependencies:
       - tqdm
       - wandb
       - deepspeed
-      - transformers==5.3.0
+      - transformers==5.2.0
       - datasets
       - huggingface
       - peft
