@@ -487,7 +487,3 @@ class ParquetSFTDataModule(LightningDataModule):
 
     def predict_dataloader(self):
         return None
-
-
-# A shorter alias for downstream training code.
-LlamaFactoryLightningDataModule = ParquetSFTDataModule

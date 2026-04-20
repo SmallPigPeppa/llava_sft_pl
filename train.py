@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover
     import pytorch_lightning as pl  # type: ignore
     from pytorch_lightning.loggers import WandbLogger  # type: ignore
 
-from llamafactory.data import LlamaFactoryLightningDataModule, get_template_and_fix_tokenizer
+from llamafactory.data import ParquetSFTDataModule, get_template_and_fix_tokenizer
 from llamafactory.hparams import DataArguments, ModelArguments
 
 
@@ -307,7 +307,7 @@ def build_datamodule(cfg: dict[str, Any], tokenizer: Any, processor: Any, model:
     hf_training_args = Seq2SeqTrainingArguments(**training_args_kwargs(train_cfg, seed=seed))
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
 
-    return LlamaFactoryLightningDataModule(
+    return ParquetSFTDataModule(
         template=template,
         model_args=model_args,
         data_args=data_args,
