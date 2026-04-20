@@ -20,7 +20,6 @@ lora:
   dropout: 0.05
   bias: none
   task_type: CAUSAL_LM
-  # all = all Linear layers outside vision tower / multimodal projector / lm_head
   target_modules: all
   freeze_vision_tower: true
   freeze_multi_modal_projector: true
@@ -29,18 +28,16 @@ lora:
 data:
   dataset_dir: data/llava_779k_demo
   dataset: demo_2000
-  template: llava
-  stage: sft
+  template: llava        # llava / qwen3_vl / intern_vl / kimi_vl
   cutoff_len: 2048
   max_samples: null
-  preprocessing_mode: online
   preprocessing_batch_size: 1000
-  tokenized_path: null
-  packing: false
-  seed: 42
-  add_default_system: true
+  preprocessing_num_workers: null
+  overwrite_cache: false
   train_on_prompt: false
+  mask_history: false
   media_dir: null
+  seed: 42
 
 train:
   output_dir: saves/llava-1.5-7b/lora/llava-779k-demo-2k
@@ -63,6 +60,5 @@ train:
   tf32: true
   dataloader_num_workers: 4
 
-  # Lightning checkpoint saving is disabled in this simplified trainer.
   resume_from_checkpoint: null
   save_model_at_end: false

@@ -1,54 +1,63 @@
 # llava_sft_pl_simplified
 
-这是一个进一步精简后的 Lightning 多模态 LoRA SFT 项目。当前版本只保留 **train-only SFT** 主路径：本地 parquet 数据读取、ShareGPT/LLaVA 格式对齐、核心模板编码、多模态 collator、Lightning 训练循环和 LoRA 注入。
+这是按“保留原工程骨架、只做减法”精简后的 Lightning 多模态 LoRA SFT 项目。
 
-## 精简后的目录
+当前范围非常窄：**train-only SFT + image-only + online tokenize**。模型侧只保留 `qwen3_vl`、`llava`、`intern_vl`、`kimi_vl` 四类模板/插件；数据侧支持图文样本和纯文本样本，纯文本样本会在 collator 中自动补一张白色 fake image，并把对应 fake image token 的 `attention_mask` 置 0、`labels` 置 `-100`，避免训练到假图。
+
+## 目录
 
 ```text
 llava_sft_pl/
 ├── train.py
+├── run_demo2k.sh
 ├── configs/demo2k.yaml
 ├── data/llava_779k_demo/dataset_info.json
 ├── llamafactory/
+│   ├── __init__.py
 │   ├── data/
-│   │   ├── collator.py
-│   │   ├── lightning_datamodule.py
-│   │   ├── mm_plugin.py
-│   │   └── template.py
+│   │   ├── __init__.py
+│   │   ├── collator.py      # image-only collator，含纯文本 fake image 补齐
+│   │   ├── datamodule.py    # parquet + ShareGPT 对齐 + online tokenize
+│   │   ├── mm_plugin.py     # 仅 qwen3vl / llava / internvl / kimivl 图片插件
+│   │   └── template.py      # 仅保留四类训练模板
 │   ├── extras/__init__.py
 │   └── hparams/__init__.py
-├── run_demo2k.sh
 └── README.md
 ```
 
-## 保留内容
+## 已删除/收窄
 
-- LLaVA / LLaVA-Next / LLaVA-Next-Video 模板与多模态插件；
-- Qwen / Qwen2-VL / Qwen3-VL / Qwen3.5-VL / Qwen audio / Qwen omni 模板与插件；
-- InternVL / InternS1 模板与插件；
-- Kimi-VL 模板与插件；
-- 本地 parquet + `dataset_info.json` 的 ShareGPT/LLaVA SFT 数据加载；
-- online tokenization 与 offline tokenization；
-- LoRA 注入、vision tower / multimodal projector 冻结、Lightning 训练、W&B logging、学习率调度。
+- 删除 `.git`、`.idea`、`__pycache__`、`__MACOSX` 等运行无关文件。
+- 删除推理、聊天、导出、评测相关路径。
+- 删除离线分词落盘和样本打包路径。
+- 删除非图片多模态数据处理逻辑。
+- 删除无关模型插件与模板，只保留 `llava`、`qwen3_vl`、`intern_vl`、`kimi_vl` 及别名 `qwen3vl`、`internvl`、`kimivl`。
+- 删除大量为全量 LLaMA-Factory 兼容而存在的分支、断言和注册表。
 
-## 删除/合并内容
+## 数据格式
 
-- val/eval/test/predict dataloader 与相关参数；
-- `data_utils.py`、`converter.py`、`parser.py`、`loader.py`、`processor/` 等拆得很碎的数据模块，已合并进 `data/lightning_datamodule.py`；
-- `formatter.py` 与 `tool_utils.py`，已合并为 `data/template.py` 内的极简 formatter；
-- `extras/constants.py`、`extras/logging.py`、`extras/misc.py`、`extras/packages.py`，已合并为 `extras/__init__.py`；
-- `hparams/data_args.py`、`hparams/model_args.py`，已合并为 `hparams/__init__.py`；
-- `.git`、`.idea`、`__pycache__`、`__MACOSX` 等与运行无关的文件。
-
-## 运行 demo2k
-
-确认 `data/llava_779k_demo/dataset_info.json` 里的 parquet 路径可访问。当前 `demo_2000` 指向：
+`dataset_info.json` 仍使用 LLaMA-Factory 风格：
 
 ```json
-"file_name": "/ppio_net0/datasets/parquet/llava_779k_demo_2000"
+{
+  "demo_2000": {
+    "file_name": "/path/to/parquet_or_dir",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    }
+  }
+}
 ```
 
-启动：
+图文样本：`images` 列可以是图片路径、图片路径列表、`{"path": ...}` 或带 bytes 的字典。样本文本里如果缺少 `<image>`，代码会自动把缺失的 `<image>` 插到第一轮 user 前面。
+
+纯文本样本：可以不配置 `images` 列，或该列为空。tokenize 时不会插入 `<image>`；collator 会给该样本追加 fake image token，并把 fake token mask 掉。
+
+## 运行
+
+确认 `data/llava_779k_demo/dataset_info.json` 里的 parquet 路径可访问，然后：
 
 ```bash
 export WANDB_API_KEY=你的_key
@@ -64,39 +73,26 @@ python train.py --config configs/demo2k.yaml \
   train.num_train_epochs=1
 ```
 
-## 数据配置
-
-默认只保留 SFT 训练路径：
+## 模板选择
 
 ```yaml
 data:
-  dataset_dir: data/llava_779k_demo
-  dataset: demo_2000
-  template: llava
-  stage: sft
-  preprocessing_mode: online
-  packing: false
+  template: llava      # llava / qwen3_vl / intern_vl / kimi_vl
 ```
 
-`preprocessing_mode: online` 表示每个 epoch 在 DataLoader worker 中动态 tokenize，不额外落盘。若要离线 tokenize：
-
-```bash
-python train.py --config configs/demo2k.yaml \
-  data.preprocessing_mode=offline \
-  data.tokenized_path=data/tokenized/demo_2000_sft
-```
-
-## 模板选择
-
-常用模板名：`llava`、`llava_next`、`llava_next_qwen`、`qwen`、`qwen2_vl`、`qwen3_vl`、`qwen3_vl_nothink`、`intern_vl`、`intern_s1`、`kimi_vl`。
+别名也可用：`qwen3vl`、`internvl`、`kimivl`。
 
 ## 保存策略
 
-默认不保存 Lightning checkpoint：
+默认不保存最终 adapter：
 
 ```yaml
 train:
   save_model_at_end: false
 ```
 
-需要训练结束保存最终 LoRA adapter 和 processor 时，设置 `train.save_model_at_end=true`。
+需要训练结束保存 LoRA adapter 和 processor 时设置：
+
+```bash
+python train.py --config configs/demo2k.yaml train.save_model_at_end=true
+```
