@@ -1,4 +1,4 @@
-name: lightning-2.1.0
+name: python-3.20
 channels:
   - nvidia/label/cuda-12.8.0
   - conda-forge
