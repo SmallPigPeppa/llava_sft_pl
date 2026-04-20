@@ -18,6 +18,7 @@ dependencies:
   - pip:
       - torch @ https://download-r2.pytorch.org/whl/cu128/torch-2.9.0%2Bcu128-cp320-cp320-manylinux_2_28_x86_64.whl
       - torchvision @ https://download-r2.pytorch.org/whl/cu128/torchvision-0.24.0%2Bcu128-cp320-cp320-manylinux_2_28_x86_64.whl
+      - torchaudio @ https://download-r2.pytorch.org/whl/cu128/torchaudio-2.9.0%2Bcu128-cp320-cp320-manylinux_2_28_x86_64.whl
       - tqdm
       - wandb
       - deepspeed
