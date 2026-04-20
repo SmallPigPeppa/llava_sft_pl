@@ -23,9 +23,10 @@ dependencies:
       - wandb
       - deepspeed
       - transformers==5.2.0
-      - datasets
+      - datasets==4.0.0
+      - accelerate==1.11.0
       - huggingface
-      - peft
+      - peft==0.18.1
       - omegaconf
       - jsonargparse
       - lightning==2.1.0
