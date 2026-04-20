@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lightning DataModule for the simplified parquet-only PT/SFT data path.
+"""Lightning DataModule for the simplified parquet-only SFT data path.
 
 This module intentionally reuses LlamaFactory's dataset converters, templates,
 dataset processors and collators.  The only parts that are simplified are:
 
 * load local parquet files only;
 * expose train dataloader only;
-* support PT and SFT only;
+* support SFT only;
 * support two tokenization modes:
   - ``offline``: tokenize the whole train set and save it to ``tokenized_path``;
   - ``online``: tokenize in DataLoader workers every epoch without saving.
@@ -34,7 +34,6 @@ from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional
 import numpy as np
 from datasets import DatasetDict, load_dataset, load_from_disk
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
-from transformers import DataCollatorForLanguageModeling
 
 from ..extras import logging
 from ..extras.constants import IGNORE_INDEX
@@ -77,7 +76,7 @@ class _OnlineTokenizedIterableDataset(IterableDataset):
     r"""Tokenize raw aligned samples on the fly and yield processed features.
 
     The tokenizer is applied to chunks of ``preprocessing_batch_size`` examples,
-    which keeps PT packing and SFT packing close to the original ``Dataset.map``
+    which keeps SFT packing close to the original ``Dataset.map``
     behavior. The final DataLoader still batches the yielded tokenized features
     with the original LlamaFactory collators.
     """
@@ -166,7 +165,7 @@ class _OnlineTokenizedIterableDataset(IterableDataset):
             yield from self._preprocess_and_yield(buffer)
 
 
-class ParquetSFTPTDataModule(LightningDataModule):
+class ParquetSFTDataModule(LightningDataModule):
     r"""Parquet-only Lightning DataModule that preserves LlamaFactory preprocessing.
 
     Args:
@@ -178,7 +177,7 @@ class ParquetSFTPTDataModule(LightningDataModule):
             resolved file must be parquet.
         training_args: LlamaFactory/HF training arguments. Batch-size and dataloader
             fields are reused when present.
-        stage: ``"pt"`` or ``"sft"``.
+        stage: ``"sft"``.
         tokenizer: HF tokenizer.
         processor: Optional multimodal processor.
         model: Optional model passed to the SFT collator for M-RoPE and model-specific
@@ -195,7 +194,7 @@ class ParquetSFTPTDataModule(LightningDataModule):
         model_args: "ModelArguments",
         data_args: "DataArguments",
         training_args: "Seq2SeqTrainingArguments",
-        stage: Literal["pt", "sft"],
+        stage: Literal["sft"],
         tokenizer: "PreTrainedTokenizer",
         processor: Optional["ProcessorMixin"] = None,
         model: Optional[Any] = None,
@@ -222,8 +221,8 @@ class ParquetSFTPTDataModule(LightningDataModule):
         self._validate_and_normalize_args()
 
     def _validate_and_normalize_args(self) -> None:
-        if self.stage not in ["pt", "sft"]:
-            raise ValueError("This Lightning DataModule only supports `stage='pt'` and `stage='sft'`.")
+        if self.stage != "sft":
+            raise ValueError("This Lightning DataModule only supports `stage='sft'`.")
 
         if self.preprocessing_mode not in ["offline", "online"]:
             raise ValueError("`preprocessing_mode` must be either 'offline' or 'online'.")
@@ -240,10 +239,9 @@ class ParquetSFTPTDataModule(LightningDataModule):
         if _get_attr(self.data_args, "dataset", None) is None:
             raise ValueError("Please set `data_args.dataset` to one or more parquet dataset names or paths.")
 
-        # Match LlamaFactory's parser side effect: PT defaults to packing when the
-        # user did not explicitly specify a packing value.
+        # Keep default SFT behavior: no packing unless explicitly enabled.
         if _get_attr(self.data_args, "packing", None) is None:
-            self.data_args.packing = self.stage == "pt"
+            self.data_args.packing = False
 
         if self.preprocessing_mode == "offline" and _get_attr(self.data_args, "tokenized_path", None) is None:
             raise ValueError(
@@ -364,9 +362,6 @@ class ParquetSFTPTDataModule(LightningDataModule):
         return merge_dataset(datasets, self.data_args, seed=seed)
 
     def _build_data_collator(self):
-        if self.stage == "pt":
-            return DataCollatorForLanguageModeling(tokenizer=self.tokenizer, mlm=False)
-
         compute_dtype = _get_attr(self.model_args, "compute_dtype", None)
         if compute_dtype is None:
             import torch
@@ -504,4 +499,4 @@ class ParquetSFTPTDataModule(LightningDataModule):
 
 
 # A shorter alias for downstream training code.
-LlamaFactoryLightningDataModule = ParquetSFTPTDataModule
+LlamaFactoryLightningDataModule = ParquetSFTDataModule

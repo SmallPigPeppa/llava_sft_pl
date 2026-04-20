@@ -7,7 +7,6 @@ model:
   torch_dtype: bfloat16
   padding_side: right
   gradient_checkpointing: true
-#  attn_implementation: flash_attention_2
   attn_implementation: null
   device_map: null
   load_in_4bit: false
@@ -21,47 +20,37 @@ lora:
   dropout: 0.05
   bias: none
   task_type: CAUSAL_LM
-  # "all" means all Linear layers outside vision tower / multimodal projector / lm_head.
+  # all = all Linear layers outside vision tower / multimodal projector / lm_head
   target_modules: all
   freeze_vision_tower: true
   freeze_multi_modal_projector: true
   prepare_kbit: false
 
 data:
-  # Must contain dataset_info.json. For demo2k this file defines demo_2000 -> /ppio_net0/datasets/parquet/llava_779k_demo_2000
   dataset_dir: data/llava_779k_demo
   dataset: demo_2000
   template: llava
   stage: sft
   cutoff_len: 2048
   max_samples: null
-  # llamafactory_lightning_datamodule_portable is train-dataloader only.
   val_size: 0.0
   preprocessing_mode: online
   preprocessing_batch_size: 1000
   tokenized_path: null
   packing: false
   seed: 42
-  image_token: "<image>"
-  # null = infer from processor/model, normally 576 for llava-1.5 336px CLIP features.
-  image_seq_len: null
   add_default_system: true
   train_on_prompt: false
   media_dir: null
-  trust_remote_code: false
 
 train:
   output_dir: saves/llava-1.5-7b/lora/llava-779k-demo-2k
   run_name: llava15-lora-779k-demo-2k
   overwrite_output_dir: true
 
-  # User requirement: logs go to W&B, no checkpoints are saved.
   report_to: [wandb]
-  save_checkpoint: false
-  save_strategy: "no"
-  save_model_at_end: false
-
   logging_steps: 1
+
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 1
   gradient_clip_val: 1.0
@@ -69,15 +58,12 @@ train:
   num_train_epochs: 1.0
   lr_scheduler_type: cosine
   warmup_ratio: 0.03
+
   bf16: true
   fp16: false
   tf32: true
-  ddp_timeout: 180000000
-  resume_from_checkpoint: null
-
-  per_device_eval_batch_size: 1
-  eval_strategy: "no"
-  eval_steps: 500
   dataloader_num_workers: 4
-  remove_unused_columns: false
-  use_cache: false
+
+  # Lightning checkpoint saving is disabled in this simplified trainer.
+  resume_from_checkpoint: null
+  save_model_at_end: false

@@ -1,3 +1,0 @@
--r llamafactory_lightning_datamodule_portable/requirements-datamodule.txt
-pyyaml
-wandb
