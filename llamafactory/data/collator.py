@@ -24,13 +24,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from peft import PeftModel
+from PIL import Image
 from transformers import DataCollatorForSeq2Seq
 
-from ..extras import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, MROPE_MODELS, is_pillow_available
-
-
-if is_pillow_available():
-    from PIL import Image
+from ..extras import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER, MROPE_MODELS
 
 
 if TYPE_CHECKING:
@@ -515,4 +512,3 @@ class SFTDataCollatorWith4DAttentionMask(MultiModalDataCollatorForSeq2Seq):
                 features[key] = value.to(self.compute_dtype)
 
         return features
-

@@ -27,6 +27,9 @@ from typing import TYPE_CHECKING, BinaryIO, Literal, NotRequired, Optional, Type
 import numpy as np
 import torch
 import torchaudio
+import av
+from PIL import Image
+from PIL.Image import Image as ImageObject
 from transformers.image_utils import get_image_size, is_valid_image, make_flat_list_of_images, to_numpy_array
 from transformers.models.mllama.processing_mllama import (
     convert_sparse_cross_attention_mask_to_dense,
@@ -40,19 +43,7 @@ from ..extras import (
     IGNORE_INDEX,
     IMAGE_PLACEHOLDER,
     VIDEO_PLACEHOLDER,
-    is_pillow_available,
-    is_pyav_available,
-    is_transformers_version_greater_than,
 )
-
-
-if is_pillow_available():
-    from PIL import Image
-    from PIL.Image import Image as ImageObject
-
-
-if is_pyav_available():
-    import av
 
 
 if TYPE_CHECKING:
@@ -1537,75 +1528,6 @@ class PaliGemmaPlugin(BasePlugin):
 
 
 @dataclass
-class PixtralPlugin(BasePlugin):
-    @override
-    def process_messages(
-        self,
-        messages: list[dict[str, str]],
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        processor: Optional["MMProcessor"],
-    ) -> list[dict[str, str]]:
-        self._validate_input(processor, images, videos, audios)
-        self._validate_messages(messages, images, videos, audios)
-        messages = deepcopy(messages)
-        if self.expand_mm_tokens:
-            mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
-            if "pixel_values" in mm_inputs:
-                # BC for transformers < 4.49.0
-                if isinstance(mm_inputs["image_sizes"], list):
-                    image_sizes = iter(mm_inputs["image_sizes"][0])
-                else:
-                    image_sizes = iter(mm_inputs["image_sizes"].tolist())
-
-                image_break_token: str = getattr(processor, "image_break_token")
-                image_end_token: str = getattr(processor, "image_end_token")
-
-        for message in messages:
-            content = message["content"]
-            while IMAGE_PLACEHOLDER in content:
-                if self.expand_mm_tokens:
-                    patch_size = processor.patch_size * getattr(processor, "spatial_merge_size", 1)
-                    height, width = next(image_sizes)
-                    num_height_tokens = height // patch_size
-                    num_width_tokens = width // patch_size
-                    replace_tokens = [[self.image_token] * num_width_tokens + [image_break_token]] * num_height_tokens
-                    replace_tokens = [item for sublist in replace_tokens for item in sublist]  # flatten list
-                    replace_tokens[-1] = image_end_token
-                    replace_str = "".join(replace_tokens)
-                else:
-                    replace_str = self.image_token
-
-                content = content.replace(IMAGE_PLACEHOLDER, replace_str, 1)
-
-            message["content"] = content
-
-        return messages
-
-    @override
-    def get_mm_inputs(
-        self,
-        images: list["ImageInput"],
-        videos: list["VideoInput"],
-        audios: list["AudioInput"],
-        imglens: list[int],
-        vidlens: list[int],
-        audlens: list[int],
-        batch_ids: list[list[int]],
-        processor: Optional["MMProcessor"],
-    ) -> dict[str, Union[list[int], "torch.Tensor"]]:
-        self._validate_input(processor, images, videos, audios)
-        mm_inputs = self._get_mm_inputs(images, videos, audios, processor)
-        # ref to this commit https://github.com/huggingface/transformers/pull/35122
-        # after transformers 4.49.0, the `image_sizes` is mandatory as an input parameter for Pixtral VisionEncoder forwarding.
-        # it can be passed into `LlavaConditionalGeneration` as a parameter.
-        if not is_transformers_version_greater_than("4.49.0"):
-            mm_inputs.pop("image_sizes", None)
-        return mm_inputs
-
-
-@dataclass
 class Qwen2AudioPlugin(BasePlugin):
     @override
     def process_messages(
@@ -2414,7 +2336,6 @@ PLUGINS = {
     "minicpm_v": MiniCPMVPlugin,
     "mllama": MllamaPlugin,
     "paligemma": PaliGemmaPlugin,
-    "pixtral": PixtralPlugin,
     "qwen2_audio": Qwen2AudioPlugin,
     "qwen2_omni": Qwen2OmniPlugin,
     "qwen2_vl": Qwen2VLPlugin,

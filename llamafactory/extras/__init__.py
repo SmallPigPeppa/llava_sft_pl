@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-import importlib.metadata
-import importlib.util
 import logging as _logging
 import os
 import sys
-from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
-
-from packaging import version
 
 AUDIO_PLACEHOLDER = os.getenv("AUDIO_PLACEHOLDER", "<audio>")
 DATA_CONFIG = "dataset_info.json"
@@ -69,20 +64,3 @@ logging = SimpleNamespace(get_logger=get_logger)
 
 def has_tokenized_data(path: str | os.PathLike[str] | None) -> bool:
     return path is not None and Path(path).is_dir() and any(Path(path).iterdir())
-
-
-def is_pillow_available() -> bool:
-    return importlib.util.find_spec("PIL") is not None
-
-
-def is_pyav_available() -> bool:
-    return importlib.util.find_spec("av") is not None
-
-
-@lru_cache
-def is_transformers_version_greater_than(content: str) -> bool:
-    try:
-        installed = version.parse(importlib.metadata.version("transformers"))
-    except Exception:
-        installed = version.parse("0.0.0")
-    return installed >= version.parse(content)
