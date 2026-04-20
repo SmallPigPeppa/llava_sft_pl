@@ -6,7 +6,6 @@ AUDIO_PLACEHOLDER = os.getenv("AUDIO_PLACEHOLDER", "<audio>")
 DATA_CONFIG = "dataset_info.json"
 IGNORE_INDEX = -100
 IMAGE_PLACEHOLDER = os.getenv("IMAGE_PLACEHOLDER", "<image>")
-RUNNING_LOG = "running_log.txt"
 VIDEO_PLACEHOLDER = os.getenv("VIDEO_PLACEHOLDER", "<video>")
 
 MROPE_MODELS = {
