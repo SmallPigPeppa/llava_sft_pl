@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Union
 
 from ..extras import logging
+from ..extras.constants import IMAGE_PLACEHOLDER
 from .data_utils import Role
 
 
@@ -215,12 +216,26 @@ class SharegptDatasetConverter(DatasetConverter):
             prompt = aligned_messages[:-1]
             response = aligned_messages[-1:]
 
+        images = self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None
+        if images:
+            # Keep compatibility with the previous project dataset wrapper: if the
+            # parquet row has image bytes/paths but the first user turn forgot the
+            # logical <image> placeholder, prefix the missing placeholders instead
+            # of failing later in the multimodal plugin.
+            num_image_placeholders = sum(message["content"].count(IMAGE_PLACEHOLDER) for message in prompt + response)
+            missing_images = max(0, len(images) - num_image_placeholders)
+            if missing_images > 0:
+                for message in prompt:
+                    if message["role"] == Role.USER.value:
+                        message["content"] = (IMAGE_PLACEHOLDER + "\n") * missing_images + message["content"]
+                        break
+
         output = {
             "_prompt": prompt,
             "_response": response,
             "_system": system,
             "_tools": example[self.dataset_attr.tools] if self.dataset_attr.tools else "",
-            "_images": self._find_medias(example[self.dataset_attr.images]) if self.dataset_attr.images else None,
+            "_images": images,
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
         }

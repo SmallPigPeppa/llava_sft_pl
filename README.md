@@ -1,32 +1,31 @@
 # minimal_llava_trainer_lightning
 
-这是把原始最小版 LLaVA LoRA SFT 项目从 Hugging Face `Trainer` 改成 Lightning `Trainer` 后的版本。
+这是一个 Lightning 版 LLaVA LoRA SFT 训练脚本。当前版本已经把原来项目里手写的 `ShareGPTLlavaDataset` / `LlavaDataCollator` 数据路径，切换为 `llamafactory_lightning_datamodule_portable`。
 
 保留内容：
 
-1. ShareGPT/LLaVA 数据加载与图文 batch 组装逻辑；
-2. LLaVA 模型加载、LoRA 注入、vision tower / projector 冻结逻辑；
-3. `configs/demo2k.yaml` 与 `config.yaml` 的参数配置文件原样保留；
+1. LLaVA 模型加载、LoRA 注入、vision tower / projector 冻结逻辑；
+2. Lightning `Trainer`、W&B logging、checkpoint/save 配置映射；
+3. `configs/demo2k.yaml` 仍然使用同一个 `dataset_info.json` 和同一个 parquet 数据源：`data/llava_779k_demo -> demo_2000`；
 4. 命令行覆盖方式保持不变：`train.learning_rate=... data.max_samples=...`。
 
 主要变化：
 
-1. `train.py` 不再使用 `transformers.Trainer` / `TrainingArguments`；
-2. 新增 `LlavaSFTLightningModule`，在 `training_step` / `validation_step` 中直接调用 HF LLaVA 模型并记录 loss；
-3. 使用 Lightning `Trainer.fit(...)` 训练；
-4. 使用 `torch.utils.data.DataLoader` 接入原有 `ShareGPTLlavaDataset` 和 `LlavaDataCollator`；
-5. `train.report_to: [wandb]` 时使用 Lightning `WandbLogger`；
-6. `save_checkpoint: false` / `save_strategy: "no"` 时禁用 Lightning checkpoint，与原配置一致；
-7. `save_model_at_end: true` 时仍然使用 `save_pretrained` 保存最终 HF/PEFT 权重和 processor。
+1. `train.py` 启动时自动把 `llamafactory_lightning_datamodule_portable/src` 放到 `sys.path` 前面；
+2. SFT parquet 数据由 `LlamaFactoryLightningDataModule` 负责加载、ShareGPT 对齐、LLaVA template 编码、multimodal collate；
+3. 默认使用 `data.preprocessing_mode: online`，不额外保存 tokenized dataset；
+4. `llamafactory_lightning_datamodule_portable` 这个 portable slice 只提供 train dataloader，所以默认把 `data.val_size` 设为 `0.0`，并把 `train.eval_strategy` 设为 `"no"`；
+5. 仍兼容原项目的数据容错：如果 parquet 行里有 image bytes/path，但第一轮 user 文本缺少 `<image>` placeholder，会在 ShareGPT converter 里自动补齐缺失的 `<image>`。
 
 ## 文件结构
 
 ```text
-minimal_llava_trainer_lightning/
-├── train.py              # LightningModule + Lightning Trainer 主训练入口
-├── data.py               # dataset_info.json 读取、Parquet/JSON/HF 数据加载、ShareGPT->SFT 编码
-├── configs/demo2k.yaml   # demo2k 的完整 YAML 配置，未改动
-├── config.yaml           # 原配置，未改动
+llava_sft_pl/
+├── train.py
+├── configs/demo2k.yaml
+├── data.py                                      # 旧手写数据路径保留但 train.py 不再使用
+├── data/llava_779k_demo/dataset_info.json       # 仍指向原来的 parquet
+├── llamafactory_lightning_datamodule_portable/  # portable LlamaFactory DataModule slice
 ├── requirements.txt
 ├── run_demo2k.sh
 └── README.md
@@ -35,9 +34,11 @@ minimal_llava_trainer_lightning/
 ## 安装
 
 ```bash
-cd llava_sft_hf
+cd llava_sft_pl
 pip install -r requirements.txt
 ```
+
+`requirements.txt` 会递归安装 `llamafactory_lightning_datamodule_portable/requirements-datamodule.txt`，以匹配 portable DataModule 需要的 Transformers / Datasets / PEFT / TRL / OmegaConf 等依赖。
 
 ## 运行 demo2k
 
@@ -47,6 +48,12 @@ pip install -r requirements.txt
 data:
   dataset_dir: data/llava_779k_demo
   dataset: demo_2000
+```
+
+`data/llava_779k_demo/dataset_info.json` 中的 `demo_2000` 仍然指向：
+
+```json
+"file_name": "/ppio_net0/datasets/parquet/llava_779k_demo_2000"
 ```
 
 启动：
@@ -65,27 +72,29 @@ python train.py --config configs/demo2k.yaml \
   train.num_train_epochs=1
 ```
 
-## HF Trainer 参数到 Lightning 的映射
+## DataModule 配置
 
-`configs/demo2k.yaml` 没有改字段名，`train.py` 内部做映射：
+当前默认配置：
 
 ```yaml
-train:
-  per_device_train_batch_size -> DataLoader(batch_size=...)
-  per_device_eval_batch_size  -> eval DataLoader(batch_size=...)
-  gradient_accumulation_steps -> Trainer(accumulate_grad_batches=...)
-  gradient_clip_val           -> Trainer(gradient_clip_val=...)
-  learning_rate               -> torch.optim.AdamW(lr=...)
-  lr_scheduler_type           -> transformers.get_scheduler(...)
-  warmup_ratio / warmup_steps -> scheduler warmup
-  num_train_epochs            -> Trainer(max_epochs=...)
-  max_steps                   -> Trainer(max_steps=...)
-  bf16 / fp16                 -> Trainer(precision="bf16-mixed" / "16-mixed")
-  logging_steps               -> Trainer(log_every_n_steps=...)
-  eval_strategy/eval_steps    -> Trainer validation interval
-  report_to: [wandb]          -> WandbLogger
-  save_checkpoint: false      -> enable_checkpointing=False
+data:
+  stage: sft
+  preprocessing_mode: online
+  preprocessing_batch_size: 1000
+  tokenized_path: null
+  val_size: 0.0
+  packing: false
 ```
+
+如果要改成离线预处理，可以这样覆盖：
+
+```bash
+python train.py --config configs/demo2k.yaml \
+  data.preprocessing_mode=offline \
+  data.tokenized_path=data/tokenized/demo_2000_sft
+```
+
+离线模式第一次运行会把 tokenized train split 保存到 `data.tokenized_path`，之后会直接从该路径加载。
 
 ## W&B 与 checkpoint
 
@@ -105,28 +114,3 @@ train:
 ## resume_from_checkpoint 注意
 
 Lightning checkpoint 格式是 `.ckpt`。如果 `train.resume_from_checkpoint` 指向目录，脚本会自动在该目录下查找最近的 `.ckpt` 文件；如果该目录只有 Hugging Face Trainer 旧 checkpoint，则不能直接作为 Lightning checkpoint 恢复。
-
-## 数据格式要求
-
-默认支持 ShareGPT/LLaVA 风格：
-
-```json
-{
-  "conversations": [
-    {"from": "human", "value": "<image>\nWhat is in the image?"},
-    {"from": "gpt", "value": "..."}
-  ],
-  "image": {"bytes": "...", "path": "xxx.jpg"}
-}
-```
-
-`image` 也可以是 PIL image、bytes、路径字符串、`{"bytes": ..., "path": ...}`，或者它们的列表。路径类图片可通过 `data.media_dir` 指定根目录。
-
-## 注意
-
-`image_seq_len` 默认会从 processor/model 里推断。对 `llava-hf/llava-1.5-7b-hf` 通常是 576。如果你更换模型后遇到 image token 数与 image feature 数不匹配，可以在 YAML 中手动设置：
-
-```yaml
-data:
-  image_seq_len: 576
-```

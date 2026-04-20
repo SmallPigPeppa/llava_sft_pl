@@ -9,8 +9,10 @@ Example:
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields
 import math
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -18,8 +20,7 @@ from typing import Any
 import torch
 import yaml
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from torch.utils.data import DataLoader
-from transformers import AutoProcessor, get_scheduler, set_seed
+from transformers import AutoProcessor, Seq2SeqTrainingArguments, get_scheduler, set_seed
 
 try:
     import lightning.pytorch as pl
@@ -38,7 +39,19 @@ except ImportError as exc:  # pragma: no cover - fallback for older installs
             "or install the updated requirements.txt."
         ) from fallback_exc
 
-from data import IGNORE_INDEX, ShareGPTLlavaDataset, load_raw_dataset, read_dataset_spec, split_train_eval
+PROJECT_ROOT = Path(__file__).resolve().parent
+PORTABLE_LF_SRC = PROJECT_ROOT / "llamafactory_lightning_datamodule_portable" / "src"
+if PORTABLE_LF_SRC.exists():
+    sys.path.insert(0, str(PORTABLE_LF_SRC))
+
+try:
+    from llamafactory.data import LlamaFactoryLightningDataModule, get_template_and_fix_tokenizer
+    from llamafactory.hparams import DataArguments, ModelArguments
+except ImportError as exc:  # pragma: no cover - depends on the runtime env
+    raise ImportError(
+        "Cannot import llamafactory_lightning_datamodule_portable. "
+        "Install requirements or keep its src directory beside train.py."
+    ) from exc
 
 
 EXCLUDE_LORA_KEYWORDS = (
@@ -280,50 +293,134 @@ def infer_image_seq_len(processor, model, data_cfg: dict[str, Any]) -> int:
     return int(seq_len)
 
 
-class LlavaDataCollator:
-    """Pad text labels and build image tensors through the HF image processor."""
+def _init_dataclass_kwargs(cls: type, source: dict[str, Any]) -> dict[str, Any]:
+    """Keep only __init__ fields accepted by a dataclass-like config object."""
+    allowed = {field.name for field in fields(cls) if getattr(field, "init", True)}
+    return {key: value for key, value in source.items() if key in allowed}
 
-    def __init__(self, tokenizer, processor, pad_to_multiple_of: int | None = None) -> None:
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.pad_to_multiple_of = pad_to_multiple_of
 
-    def _pad_labels(self, labels: list[list[int]], max_len: int) -> torch.Tensor:
-        padded = []
-        for row in labels:
-            pad_len = max_len - len(row)
-            if self.tokenizer.padding_side == "right":
-                padded.append(row + [IGNORE_INDEX] * pad_len)
-            else:
-                padded.append([IGNORE_INDEX] * pad_len + row)
-        return torch.tensor(padded, dtype=torch.long)
+def _training_args_kwargs(train_cfg: dict[str, Any], seed: int) -> dict[str, Any]:
+    """Build the minimal HF args object required by the portable DataModule."""
+    candidates: dict[str, Any] = {
+        "output_dir": str(train_cfg.get("output_dir", "saves/lightning_sft")),
+        "overwrite_output_dir": bool(train_cfg.get("overwrite_output_dir", False)),
+        "do_train": True,
+        "do_eval": False,
+        "per_device_train_batch_size": int(train_cfg.get("per_device_train_batch_size", 1)),
+        "gradient_accumulation_steps": int(train_cfg.get("gradient_accumulation_steps", 1)),
+        "dataloader_num_workers": int(train_cfg.get("dataloader_num_workers", 0)),
+        "dataloader_pin_memory": bool(train_cfg.get("dataloader_pin_memory", torch.cuda.is_available())),
+        "dataloader_drop_last": bool(train_cfg.get("dataloader_drop_last", False)),
+        "remove_unused_columns": bool(train_cfg.get("remove_unused_columns", False)),
+        "seed": seed,
+        "logging_steps": int(train_cfg.get("logging_steps", 50)),
+        "report_to": train_cfg.get("report_to", []),
+        "save_strategy": str(train_cfg.get("save_strategy", "no")),
+        "save_steps": int(train_cfg.get("save_steps", 500)),
+    }
 
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
-        images = []
-        text_features = []
-        label_rows = []
-        for feature in features:
-            images.extend(feature.get("images") or [])
-            text_features.append(
-                {
-                    "input_ids": feature["input_ids"],
-                    "attention_mask": feature["attention_mask"],
-                }
-            )
-            label_rows.append(feature["labels"])
+    optional_keys = (
+        "save_total_limit",
+        "bf16",
+        "fp16",
+        "dataloader_persistent_workers",
+        "dataloader_prefetch_factor",
+        "disable_tqdm",
+        "local_rank",
+        "ddp_find_unused_parameters",
+        "ddp_timeout",
+    )
+    for key in optional_keys:
+        if key in train_cfg and train_cfg[key] is not None:
+            candidates[key] = train_cfg[key]
 
-        batch = self.tokenizer.pad(
-            text_features,
-            padding=True,
-            pad_to_multiple_of=self.pad_to_multiple_of,
-            return_tensors="pt",
+    if "enable_progress_bar" in train_cfg and "disable_tqdm" not in candidates:
+        candidates["disable_tqdm"] = not bool(train_cfg["enable_progress_bar"])
+
+    allowed = {field.name for field in fields(Seq2SeqTrainingArguments) if getattr(field, "init", True)}
+    return {key: value for key, value in candidates.items() if key in allowed}
+
+
+def patch_processor_for_llamafactory(processor: Any, model: torch.nn.Module, data_cfg: dict[str, Any]) -> None:
+    """Fill LLaVA processor attrs expected by the LlamaFactory multimodal plugin."""
+    template = str(data_cfg.get("template", "")).lower()
+    if processor is None or not template.startswith("llava"):
+        return
+
+    model_config = getattr(model, "config", None)
+    vision_config = getattr(model_config, "vision_config", None)
+
+    if getattr(processor, "patch_size", None) is None:
+        setattr(processor, "patch_size", getattr(vision_config, "patch_size", 14))
+    if getattr(processor, "num_additional_image_tokens", None) is None:
+        setattr(processor, "num_additional_image_tokens", 1)
+    if getattr(processor, "vision_feature_select_strategy", None) is None:
+        setattr(
+            processor,
+            "vision_feature_select_strategy",
+            getattr(model_config, "vision_feature_select_strategy", "default"),
         )
-        batch["labels"] = self._pad_labels(label_rows, max_len=batch["input_ids"].shape[1])
 
-        if images:
-            image_inputs = self.processor.image_processor(images, return_tensors="pt")
-            batch.update(image_inputs)
-        return batch
+
+def build_llamafactory_datamodule(
+    cfg: dict[str, Any],
+    tokenizer: Any,
+    processor: Any,
+    model: torch.nn.Module,
+) -> LlamaFactoryLightningDataModule:
+    """Use the portable LlamaFactory parquet SFT DataModule for the existing parquet dataset."""
+    data_cfg = dict(cfg.get("data") or {})
+    model_cfg = dict(cfg.get("model") or {})
+    train_cfg = dict(cfg.get("train") or {})
+    seed = int(cfg.get("seed", data_cfg.get("seed", 42)))
+
+    # The portable DataModule is intentionally train-only. Keep the parquet source unchanged,
+    # but disable the old manual train/eval split path.
+    if float(data_cfg.get("val_size", 0.0) or 0.0) > 1e-6:
+        print("Portable LlamaFactory DataModule is train-only; forcing data.val_size=0.0.")
+        data_cfg["val_size"] = 0.0
+
+    if data_cfg.get("add_default_system") is False and data_cfg.get("default_system") is None:
+        data_cfg["default_system"] = ""
+
+    data_kwargs = _init_dataclass_kwargs(DataArguments, data_cfg)
+    data_kwargs.setdefault("template", "llava")
+    data_kwargs.setdefault("val_size", 0.0)
+    data_args = DataArguments(**data_kwargs)
+
+    model_kwargs = _init_dataclass_kwargs(ModelArguments, model_cfg)
+    if "model_name_or_path" not in model_kwargs and model_cfg.get("name_or_path"):
+        model_kwargs["model_name_or_path"] = model_cfg["name_or_path"]
+    model_args = ModelArguments(**model_kwargs)
+
+    compute_dtype = resolve_torch_dtype(model_cfg.get("torch_dtype"))
+    if isinstance(compute_dtype, torch.dtype):
+        model_args.compute_dtype = compute_dtype
+    elif bool(train_cfg.get("bf16", False)):
+        model_args.compute_dtype = torch.bfloat16
+    elif bool(train_cfg.get("fp16", False)):
+        model_args.compute_dtype = torch.float16
+
+    model_args.block_diag_attn = bool(data_cfg.get("neat_packing", False))
+    model_args.model_max_length = int(data_cfg.get("cutoff_len", 2048))
+
+    training_args = Seq2SeqTrainingArguments(**_training_args_kwargs(train_cfg, seed=seed))
+    template = get_template_and_fix_tokenizer(tokenizer, data_args)
+
+    preprocessing_mode = str(data_cfg.get("preprocessing_mode", "online")).lower()
+    return LlamaFactoryLightningDataModule(
+        template=template,
+        model_args=model_args,
+        data_args=data_args,
+        training_args=training_args,
+        stage=str(data_cfg.get("stage", "sft")),
+        tokenizer=tokenizer,
+        processor=processor,
+        model=model,
+        preprocessing_mode=preprocessing_mode,
+        train_batch_size=int(train_cfg.get("per_device_train_batch_size", 1)),
+        shuffle=bool(train_cfg.get("shuffle", True)),
+    )
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -409,6 +506,11 @@ class LlavaSFTLightningModule(pl.LightningModule):
             return int(input_ids.shape[0])
         return 1
 
+    def on_train_epoch_start(self) -> None:
+        datamodule = getattr(self.trainer, "datamodule", None)
+        if hasattr(datamodule, "set_epoch"):
+            datamodule.set_epoch(int(self.current_epoch))
+
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         outputs = self.model(**batch)
         loss = self._loss_from_outputs(outputs)
@@ -475,25 +577,6 @@ class LlavaSFTLightningModule(pl.LightningModule):
                 "name": scheduler_name,
             },
         }
-
-
-def build_dataloader(dataset, collator: LlavaDataCollator, train_cfg: dict[str, Any], train: bool) -> DataLoader:
-    if train:
-        batch_size = int(train_cfg.get("per_device_train_batch_size", 1))
-        shuffle = bool(train_cfg.get("shuffle", True))
-    else:
-        batch_size = int(train_cfg.get("per_device_eval_batch_size", train_cfg.get("per_device_train_batch_size", 1)))
-        shuffle = False
-
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=int(train_cfg.get("dataloader_num_workers", 0)),
-        collate_fn=collator,
-        pin_memory=bool(train_cfg.get("dataloader_pin_memory", torch.cuda.is_available())),
-        drop_last=bool(train_cfg.get("dataloader_drop_last", False)) if train else False,
-    )
 
 
 def build_precision(train_cfg: dict[str, Any]) -> str:
@@ -729,50 +812,14 @@ def main() -> None:
         set_use_cache(model, False)
 
     data_cfg = cfg["data"]
-    spec = read_dataset_spec(data_cfg)
-    raw_ds = load_raw_dataset(data_cfg)
-    train_raw, eval_raw = split_train_eval(raw_ds, data_cfg)
-
-    image_seq_len = infer_image_seq_len(processor, model, data_cfg)
-    print(f"Using image_seq_len={image_seq_len}")
-    print(f"Loaded dataset={spec.dataset_name}, train={len(train_raw)}, eval={len(eval_raw) if eval_raw is not None else 0}")
-
-    train_ds = ShareGPTLlavaDataset(
-        train_raw,
-        tokenizer=tokenizer,
-        spec=spec,
-        cutoff_len=int(data_cfg.get("cutoff_len", 2048)),
-        image_seq_len=image_seq_len,
-        image_token=str(data_cfg.get("image_token", "<image>")),
-        add_default_system=bool(data_cfg.get("add_default_system", True)),
-        train_on_prompt=bool(data_cfg.get("train_on_prompt", False)),
-    )
-    eval_ds = None
-    if eval_raw is not None:
-        eval_ds = ShareGPTLlavaDataset(
-            eval_raw,
-            tokenizer=tokenizer,
-            spec=spec,
-            cutoff_len=int(data_cfg.get("cutoff_len", 2048)),
-            image_seq_len=image_seq_len,
-            image_token=str(data_cfg.get("image_token", "<image>")),
-            add_default_system=bool(data_cfg.get("add_default_system", True)),
-            train_on_prompt=bool(data_cfg.get("train_on_prompt", False)),
-        )
+    patch_processor_for_llamafactory(processor, model, data_cfg)
+    datamodule = build_llamafactory_datamodule(cfg, tokenizer=tokenizer, processor=processor, model=model)
 
     train_cfg = cfg["train"]
-    collator = LlavaDataCollator(
-        tokenizer=tokenizer,
-        processor=processor,
-        pad_to_multiple_of=train_cfg.get("pad_to_multiple_of"),
-    )
-    train_loader = build_dataloader(train_ds, collator, train_cfg, train=True)
-    eval_loader = build_dataloader(eval_ds, collator, train_cfg, train=False) if eval_ds is not None else None
-
     lightning_module = LlavaSFTLightningModule(model=model, train_cfg=train_cfg)
-    trainer = build_trainer(cfg, train_cfg, has_eval=eval_ds is not None, num_train_batches=len(train_loader))
+    trainer = build_trainer(cfg, train_cfg, has_eval=False, num_train_batches=None)
     ckpt_path = resolve_resume_checkpoint(train_cfg.get("resume_from_checkpoint"))
-    trainer.fit(lightning_module, train_dataloaders=train_loader, val_dataloaders=eval_loader, ckpt_path=ckpt_path)
+    trainer.fit(lightning_module, datamodule=datamodule, ckpt_path=ckpt_path)
 
     if bool(train_cfg.get("save_model_at_end", False)):
         save_final_pretrained(trainer, lightning_module, processor, str(train_cfg["output_dir"]))

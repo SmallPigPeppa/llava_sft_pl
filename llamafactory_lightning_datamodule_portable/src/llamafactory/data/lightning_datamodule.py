@@ -280,7 +280,11 @@ class ParquetSFTPTDataModule(LightningDataModule):
                 for filename in sorted(filenames):
                     if filename.endswith(".parquet"):
                         data_files.append(os.path.join(root, filename))
-                    elif not filename.startswith("."):
+                    elif filename.startswith(".") or filename.startswith("_"):
+                        # Ignore common local filesystem / parquet sidecar files such as
+                        # .DS_Store, _SUCCESS, _metadata and _common_metadata.
+                        continue
+                    else:
                         raise ValueError(
                             f"Only parquet files are allowed, but found `{os.path.join(root, filename)}`."
                         )

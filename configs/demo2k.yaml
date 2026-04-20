@@ -32,9 +32,15 @@ data:
   dataset_dir: data/llava_779k_demo
   dataset: demo_2000
   template: llava
+  stage: sft
   cutoff_len: 2048
   max_samples: null
-  val_size: 0.001
+  # llamafactory_lightning_datamodule_portable is train-dataloader only.
+  val_size: 0.0
+  preprocessing_mode: online
+  preprocessing_batch_size: 1000
+  tokenized_path: null
+  packing: false
   seed: 42
   image_token: "<image>"
   # null = infer from processor/model, normally 576 for llava-1.5 336px CLIP features.
@@ -70,7 +76,7 @@ train:
   resume_from_checkpoint: null
 
   per_device_eval_batch_size: 1
-  eval_strategy: steps
+  eval_strategy: "no"
   eval_steps: 500
   dataloader_num_workers: 4
   remove_unused_columns: false
