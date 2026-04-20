@@ -1,71 +1,55 @@
-# llava_sft_pl_simplified
+# llava_sft_pl_slim
 
-这是一个精简后的 Lightning 版 LLaVA LoRA SFT 项目。数据读取、ShareGPT 对齐、LLaVA template 编码、multimodal collate 全部走内置的 LLaMA-Factory 数据路径；原来的手写 `data.py` / `ShareGPTLlavaDataset` / 自定义 collator 已删除。
-
-## 精简后的目录
-
-```text
-llava_sft_pl_simplified/
-├── train.py
-├── configs/demo2k.yaml
-├── data/llava_779k_demo/dataset_info.json
-├── llamafactory/                 # 只保留训练所需的 LLaMA-Factory data/template/collator/hparams 子集
-├── requirements.txt
-├── run_demo2k.sh
-├── LICENSE.llamafactory
-└── README.md
-```
-
-## 保留内容
-
-- LLaVA 模型加载；
-- LoRA 注入，以及 vision tower / multimodal projector 冻结；
-- Lightning 训练循环、W&B logging、学习率调度；
-- LLaMA-Factory SFT 数据加载：本地 parquet、`dataset_info.json`、ShareGPT 转换、LLaVA multimodal collator；
-- `python train.py --config ... key=value` 的覆盖方式。
-
-## 删除内容
-
-- 顶层 `data.py` 手写数据集和旧数据加载函数；
-- `llamafactory_lightning_datamodule_portable/` 外层包装目录、examples、manifest、filelist；
-- LLaMA-Factory 中本项目不使用的 RM/PPO/KTO/feedback/pairwise/unsupervised/pretrain 数据处理器；
-- evaluation split、checkpoint callback、DeepSpeed/DDP 自定义策略等训练脚本分支；
-- 多余的 hparams/parser/training/eval/generation 参数文件。
-
-## 安装
+这是一个进一步精简后的 Lightning 版 LLaVA LoRA SFT 项目。核心入口仍然是：
 
 ```bash
-cd llava_sft_pl_simplified
-pip install -r requirements.txt
+python train.py --config configs/demo2k.yaml
 ```
+
+## 这次精简的重点
+
+`llamafactory/` 被收缩成 SFT 训练所需的最小兼容层：
+
+```text
+llamafactory/
+├── __init__.py
+├── hparams/
+│   └── __init__.py          # DataArguments / ModelArguments
+└── data/
+    ├── __init__.py
+    ├── template.py          # LLaVA-family prompt template + image token expansion
+    └── lightning_datamodule.py  # parquet + ShareGPT + online/offline tokenize + collator
+```
+
+相比上一版，删除了：
+
+- `extras/`、`processor/`、`parser.py`、`converter.py`、`loader.py`、`collator.py`、`formatter.py`、`tool_utils.py`、`mm_plugin.py` 等拆得很碎的模块；
+- RM / PPO / DPO / KTO / ranking / eval split / streaming / packing / tool-call / audio-video 预处理路径；
+- `.git`、`.idea`、`__pycache__`、`__MACOSX` 等与运行无关的文件。
+
+## 保留的能力
+
+- LLaVA / LLaVA-NeXT 图像 SFT 模板与图像 token 展开；
+- parquet 本地数据加载；
+- `dataset_info.json` 数据集声明；
+- ShareGPT 格式转换；
+- online tokenization，即 DataLoader worker 中动态 tokenize；
+- offline tokenization，即保存到 `data.tokenized_path`；
+- multimodal collate：padding `input_ids` / `attention_mask` / `labels`，并用 Hugging Face processor 生成 `pixel_values` 等视觉输入；
+- `python train.py --config ... key=value` 覆盖参数。
+
+当前保留的模板名：
+
+```text
+llava, llava_next, llava_next_llama3, llava_next_mistral,
+llava_next_qwen, llava_next_yi, yi_vl, vicuna, default, empty
+```
+
+另外保留了 `video_llava`、`llava_next_video*` 的模板名字用于兼容旧配置，但这个 slim 版本不再携带视频/音频预处理代码；如果数据列里真的包含视频或音频，会直接报出明确错误。
 
 ## 运行 demo2k
 
-确认 `data/llava_779k_demo/dataset_info.json` 里的 parquet 路径可访问。当前 `demo_2000` 指向：
-
-```json
-"file_name": "/ppio_net0/datasets/parquet/llava_779k_demo_2000"
-```
-
-启动：
-
-```bash
-export WANDB_API_KEY=你的_key
-./run_demo2k.sh
-```
-
-也可以覆盖参数：
-
-```bash
-python train.py --config configs/demo2k.yaml \
-  data.max_samples=64 \
-  train.learning_rate=1e-4 \
-  train.num_train_epochs=1
-```
-
-## 数据配置
-
-默认只保留 SFT 训练路径：
+`configs/demo2k.yaml` 默认数据集：
 
 ```yaml
 data:
@@ -78,21 +62,22 @@ data:
   packing: false
 ```
 
-`preprocessing_mode: online` 表示每个 epoch 在 DataLoader worker 中动态 tokenize，不额外落盘。若要离线 tokenize：
+`data/llava_779k_demo/dataset_info.json` 中的 `file_name` 仍然指向本地 parquet 路径。确认路径可访问后运行：
+
+```bash
+export WANDB_API_KEY=你的_key
+./run_demo2k.sh
+```
+
+覆盖参数示例：
 
 ```bash
 python train.py --config configs/demo2k.yaml \
-  data.preprocessing_mode=offline \
-  data.tokenized_path=data/tokenized/demo_2000_sft
+  data.max_samples=64 \
+  train.learning_rate=1e-4 \
+  train.num_train_epochs=1
 ```
 
-## 保存策略
+## 注意
 
-精简版默认不保存 Lightning checkpoint：
-
-```yaml
-train:
-  save_model_at_end: false
-```
-
-如果需要训练结束后保存最终 LoRA adapter 和 processor，把 `train.save_model_at_end=true`。
+这个版本不是完整 LLaMA-Factory；它只保留本项目训练 LLaVA-family 图像 SFT 所需的代码。需要恢复 Qwen2-VL、MiniCPM-V、InternVL、audio/video 或 tool-call 等上游完整能力时，应使用完整版 LLaMA-Factory。

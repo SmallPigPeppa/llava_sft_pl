@@ -1,4 +1,4 @@
-"""Tiny bundled subset of LLaMA-Factory used by this project."""
+"""Tiny LLaMA-Factory-compatible subset used by this LLaVA SFT project."""
 
-VERSION = "portable-sft"
+VERSION = "llava-sft-tiny"
 __version__ = VERSION
