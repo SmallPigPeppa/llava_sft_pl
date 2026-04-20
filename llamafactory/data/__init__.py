@@ -1,4 +1,4 @@
-from .lightning_datamodule import ParquetSFTDataModule
+from .datamodule import ParquetSFTDataModule
 from .template import TEMPLATES, Template, get_template_and_fix_tokenizer
 
 __all__ = [
