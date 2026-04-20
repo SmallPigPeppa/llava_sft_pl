@@ -27,6 +27,7 @@ dependencies:
       - accelerate==1.11.0
       - huggingface
       - peft==0.18.1
+      - trl==0.24.0
       - omegaconf
       - jsonargparse
       - lightning==2.1.0

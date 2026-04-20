@@ -75,22 +75,22 @@ class AverageMeter:
 
 def check_version(requirement: str, mandatory: bool = False) -> None:
     r"""Optionally check the package version."""
-    # if is_env_enabled("DISABLE_VERSION_CHECK") and not mandatory:
-    #     logger.warning_rank0_once("Version checking has been disabled, may lead to unexpected behaviors.")
-    #     return
-    #
-    # if "gptmodel" in requirement or "autoawq" in requirement:
-    #     pip_command = f"pip install {requirement} --no-build-isolation"
-    # else:
-    #     pip_command = f"pip install {requirement}"
-    #
-    # if mandatory:
-    #     hint = f"To fix: run `{pip_command}`."
-    # else:
-    #     hint = f"To fix: run `{pip_command}` or set `DISABLE_VERSION_CHECK=1` to skip this check."
-    #
-    # require_version(requirement, hint)
-    pass
+    if is_env_enabled("DISABLE_VERSION_CHECK") and not mandatory:
+        logger.warning_rank0_once("Version checking has been disabled, may lead to unexpected behaviors.")
+        return
+
+    if "gptmodel" in requirement or "autoawq" in requirement:
+        pip_command = f"pip install {requirement} --no-build-isolation"
+    else:
+        pip_command = f"pip install {requirement}"
+
+    if mandatory:
+        hint = f"To fix: run `{pip_command}`."
+    else:
+        hint = f"To fix: run `{pip_command}` or set `DISABLE_VERSION_CHECK=1` to skip this check."
+
+    require_version(requirement, hint)
+    # pass
 
 
 def check_dependencies() -> None:
