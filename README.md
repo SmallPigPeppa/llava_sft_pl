@@ -57,7 +57,7 @@ llava_sft_pl/
 
 ## 运行
 
-确认 `data/llava_779k_demo/dataset_info.json` 里的 parquet 路径可访问，然后：
+确认 `data/llava_779k_demo/dataset_info.json` 里的 parquet 路径可访问（当前示例为 `/ppio_net0/datasets/parquet/llava779k_demo2k`、`/ppio_net0/datasets/parquet/llava779k_demo10k`），然后：
 
 ```bash
 export WANDB_API_KEY=你的_key
