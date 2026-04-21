@@ -28,7 +28,7 @@ lora:
 data:
   dataset_dir: data/llava_779k_demo
   dataset: demo_2000
-  template: llava        # llava / qwen3_vl / intern_vl / kimi_vl
+  template: llava        # llava / qwen3vl / internvl / kimivl
   cutoff_len: 2048
   max_samples: null
   preprocessing_batch_size: 1000

@@ -279,20 +279,13 @@ class KimiVLPlugin(BasePlugin):
 PLUGINS: dict[str, type[BasePlugin]] = {
     "base": BasePlugin,
     "llava": LlavaPlugin,
-    "qwen3_vl": Qwen3VLPlugin,
-    "intern_vl": InternVLPlugin,
-    "kimi_vl": KimiVLPlugin,
-}
-
-ALIASES = {
-    "qwen3vl": "qwen3_vl",
-    "internvl": "intern_vl",
-    "kimivl": "kimi_vl",
+    "qwen3vl": Qwen3VLPlugin,
+    "internvl": InternVLPlugin,
+    "kimivl": KimiVLPlugin,
 }
 
 
 def get_mm_plugin(name: str, image_token: str | None = None, **kwargs: Any) -> BasePlugin:
-    name = ALIASES.get(name, name)
     if name not in PLUGINS:
         raise ValueError(f"Only image SFT plugins are kept: {sorted(PLUGINS)}")
     return PLUGINS[name](image_token=image_token, **kwargs)

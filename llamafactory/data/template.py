@@ -216,8 +216,6 @@ def _chatml_template(
 
 def get_template_and_fix_tokenizer(tokenizer: Any, data_args: Any) -> Template:
     name = data_args.template or "llava"
-    aliases = {"qwen3vl": "qwen3_vl", "internvl": "intern_vl", "kimivl": "kimi_vl"}
-    name = aliases.get(name, name)
     if name not in TEMPLATES:
         raise ValueError(f"Kept templates are {sorted(TEMPLATES)}; got {name!r}.")
     template = deepcopy(TEMPLATES[name])
@@ -237,25 +235,21 @@ register_template(
     mm_plugin=get_mm_plugin("llava", image_token="<image>"),
 )
 
-_chatml_template("qwen3_vl", get_mm_plugin("qwen3_vl", image_token="<|image_pad|>"), reasoning=True)
-_chatml_template("qwen3_vl_nothink", get_mm_plugin("qwen3_vl", image_token="<|image_pad|>"), enable_thinking=False)
+_chatml_template("qwen3vl", get_mm_plugin("qwen3vl", image_token="<|image_pad|>"), reasoning=True)
+_chatml_template("qwen3vl_nothink", get_mm_plugin("qwen3vl", image_token="<|image_pad|>"), enable_thinking=False)
 _chatml_template(
-    "intern_vl",
-    get_mm_plugin("intern_vl", image_token="<image>"),
+    "internvl",
+    get_mm_plugin("internvl", image_token="<image>"),
     default_system="你是书生·万象，英文名是InternVL，是由上海人工智能实验室、清华大学及多家合作单位联合开发的多模态大语言模型。",
 )
 register_template(
-    "kimi_vl",
+    "kimivl",
     format_user=StringFormatter(["<|im_user|>user<|im_middle|>{{content}}<|im_end|><|im_assistant|>assistant<|im_middle|>"]),
     format_assistant=StringFormatter(["{{content}}<|im_end|>"]),
     format_system=StringFormatter(["<|im_system|>system<|im_middle|>{{content}}<|im_end|>"]),
     default_system="You are a helpful assistant",
     stop_words=["<|im_end|>"],
     thought_words=("◁think▷", "◁/think▷"),
-    mm_plugin=get_mm_plugin("kimi_vl", image_token="<|media_pad|>"),
+    mm_plugin=get_mm_plugin("kimivl", image_token="<|media_pad|>"),
     template_class=ReasoningTemplate,
 )
-
-TEMPLATES["qwen3vl"] = TEMPLATES["qwen3_vl"]
-TEMPLATES["internvl"] = TEMPLATES["intern_vl"]
-TEMPLATES["kimivl"] = TEMPLATES["kimi_vl"]
