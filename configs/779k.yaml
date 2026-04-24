@@ -1,0 +1,64 @@
+seed: 42
+wandb_project: CL-debug
+
+model:
+  model_name_or_path: llava-hf/llava-1.5-7b-hf
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  padding_side: right
+  gradient_checkpointing: true
+  attn_implementation: null
+  device_map: null
+  load_in_4bit: false
+  load_in_8bit: false
+  use_cache: false
+
+lora:
+  enable: true
+  r: 8
+  alpha: 16
+  dropout: 0.05
+  bias: none
+  task_type: CAUSAL_LM
+  target_modules: all
+  freeze_vision_tower: true
+  freeze_multi_modal_projector: true
+  prepare_kbit: false
+
+data:
+  dataset_dir: data/llava_779k_demo
+  dataset: 779k
+  template: llava        # llava / qwen3vl / internvl / kimivl
+  cutoff_len: 2048
+  max_samples: null
+  preprocessing_batch_size: 1000
+  preprocessing_num_workers: null
+  overwrite_cache: false
+  train_on_prompt: false
+  mask_history: false
+  media_dir: null
+  seed: 42
+
+train:
+  output_dir: saves/llava-1.5-7b/lora/llava-779k
+  run_name: llava15-lora-779k
+  overwrite_output_dir: true
+
+  report_to: [wandb]
+  logging_steps: 1
+
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  gradient_clip_val: 1.0
+  learning_rate: 2.0e-4
+  num_train_epochs: 1.0
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+
+  bf16: true
+  fp16: false
+  tf32: true
+  dataloader_num_workers: 4
+
+  resume_from_checkpoint: null
+  save_model_at_end: false
